@@ -30,8 +30,28 @@ if [[ ! -f "${EXT_ENTRY}" ]]; then
   exit 1
 fi
 
-# Use a fresh temp root per run unless the caller provided one.
-TEAMS_ROOT=${PI_TEAMS_ROOT_DIR:-"/tmp/pi-teams-$(date +%Y%m%d-%H%M%S)"}
+# The leader owns the task-scoped temp root. Workers inherit this exact value.
+validate_task_root() {
+  [[ "$1" =~ ^/tmp/[^/]+/[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-7[0-9a-fA-F]{3}-[89a-fA-F][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$ ]]
+}
+
+if [[ -n "${TASK_TMP_ROOT:-}" && -n "${PI_TEAMS_ROOT_DIR:-}" && "${TASK_TMP_ROOT}" != "${PI_TEAMS_ROOT_DIR}" ]]; then
+  echo "ERROR: TASK_TMP_ROOT and PI_TEAMS_ROOT_DIR must match" >&2
+  exit 1
+fi
+if [[ -n "${TASK_TMP_ROOT:-}" ]]; then
+  validate_task_root "${TASK_TMP_ROOT}" || { echo "ERROR: invalid TASK_TMP_ROOT (expected /tmp/{REPO_NAME}/{UUIDv7})" >&2; exit 1; }
+  TEAMS_ROOT=${TASK_TMP_ROOT}
+elif [[ -n "${PI_TEAMS_ROOT_DIR:-}" ]]; then
+  validate_task_root "${PI_TEAMS_ROOT_DIR}" || { echo "ERROR: invalid PI_TEAMS_ROOT_DIR (expected /tmp/{REPO_NAME}/{UUIDv7})" >&2; exit 1; }
+  TEAMS_ROOT=${PI_TEAMS_ROOT_DIR}
+else
+  REPO_NAME=$(basename -- "${REPO_DIR}")
+  TASK_UUID=$(uuidgen --time-v7)
+  TEAMS_ROOT="/tmp/${REPO_NAME}/${TASK_UUID}"
+fi
+export PI_TEAMS_ROOT_DIR=${TEAMS_ROOT}
+export TASK_TMP_ROOT=${TEAMS_ROOT}
 mkdir -p "${TEAMS_ROOT}"
 
 # If the session already exists, refuse (avoid clobbering a running team).
@@ -44,7 +64,7 @@ fi
 echo "Starting leader..."
 # Leader (interactive)
 tmux new-session -d -s "${SESSION_NAME}" -c "${REPO_DIR}" \
-  "PI_TEAMS_ROOT_DIR=${TEAMS_ROOT} pi -e ${EXT_ENTRY}"
+  "PI_TEAMS_ROOT_DIR=${TEAMS_ROOT} TASK_TMP_ROOT=${TEAMS_ROOT} pi -e ${EXT_ENTRY}"
 
 # Wait for the leader to create the team directory.
 TEAM_ID=""
@@ -70,7 +90,7 @@ echo "Starting workers: ${WORKERS[*]}"
 for name in "${WORKERS[@]}"; do
   # Each worker is an interactive pi session running the extension in worker mode.
   tmux new-window -t "${SESSION_NAME}" -n "${name}" -c "${REPO_DIR}" \
-    "PI_TEAMS_ROOT_DIR=${TEAMS_ROOT} PI_TEAMS_WORKER=1 PI_TEAMS_TEAM_ID=${TEAM_ID} PI_TEAMS_AGENT_NAME=${name} pi -e ${EXT_ENTRY}"
+    "PI_TEAMS_ROOT_DIR=${TEAMS_ROOT} TASK_TMP_ROOT=${TEAMS_ROOT} PI_TEAMS_WORKER=1 PI_TEAMS_TEAM_ID=${TEAM_ID} PI_TEAMS_AGENT_NAME=${name} pi -e ${EXT_ENTRY}"
 done
 
 cat <<EOF
@@ -79,6 +99,7 @@ OK
 
 tmux session: ${SESSION_NAME}
 teams root:   ${TEAMS_ROOT}
+task tmp root: ${TASK_TMP_ROOT}
 team id:      ${TEAM_ID}
 
 Attach:

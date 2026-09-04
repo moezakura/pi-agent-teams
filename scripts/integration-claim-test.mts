@@ -10,7 +10,6 @@
  *   npx tsx scripts/integration-claim-test.mts --agents 2 --tasks 3 --timeoutSec 90
  */
 
-import * as os from "node:os";
 import * as path from "node:path";
 import { randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
@@ -69,8 +68,8 @@ if (agents < 2 || tasks < 3) {
 
 const teamId = randomUUID();
 const teamDir = getTeamDir(teamId);
-const sessionsDir = path.join(os.homedir(), ".pi", "agent", "teams", teamId, "sessions");
-const logsDir = path.join(os.homedir(), ".pi", "agent", "teams", teamId, "logs");
+const sessionsDir = path.join(teamDir, "sessions");
+const logsDir = path.join(teamDir, "logs");
 
 const scriptDir = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(scriptDir, "..");

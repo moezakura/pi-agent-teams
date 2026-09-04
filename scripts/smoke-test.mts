@@ -9,7 +9,6 @@
 
 import * as fs from "node:fs";
 import * as path from "node:path";
-import * as os from "node:os";
 
 // We import from .ts source (tsx handles it)
 import { withLock } from "../extensions/teams/fs-lock.js";
@@ -102,7 +101,12 @@ function isRecord(v: unknown): v is Record<string, unknown> {
 	return typeof v === "object" && v !== null;
 }
 
-const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "pi-teams-smoke-"));
+// paths.ts validates the shared teams root as /tmp/{repo}/{UUIDv7}. Keep the
+// smoke sandbox in that same shape so style/hook tests exercise the production
+// root validation instead of bypassing it with mkdtemp's arbitrary suffix.
+const smokeRunSuffix = `${process.pid.toString(16)}${process.hrtime.bigint().toString(16)}`.slice(-12).padStart(12, "0");
+const tmpRoot = path.join("/tmp", "pi-teams-smoke", `01900000-0000-7000-8000-${smokeRunSuffix}`);
+fs.mkdirSync(tmpRoot, { recursive: true });
 const teamDir = path.join(tmpRoot, "team-test");
 const taskListId = "smoke-tl";
 

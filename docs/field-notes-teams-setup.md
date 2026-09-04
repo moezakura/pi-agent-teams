@@ -40,7 +40,8 @@ First impressions:
 1. Pick a temp Teams root:
 
    ```bash
-   export PI_TEAMS_ROOT_DIR="/tmp/pi-teams-$(date +%Y%m%d-%H%M%S)"
+   export PI_TEAMS_ROOT_DIR="/tmp/{REPO_NAME}/{UUIDv7}"
+   export TASK_TMP_ROOT="$PI_TEAMS_ROOT_DIR"
    mkdir -p "$PI_TEAMS_ROOT_DIR"
    ```
 
