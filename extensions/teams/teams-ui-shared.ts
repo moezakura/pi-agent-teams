@@ -76,7 +76,7 @@ export const DISPLAY_STATUS_COLOR: Record<DisplayStatus, ThemeColor> = {
  * Default stall threshold in milliseconds.
  * Configurable via PI_TEAMS_STALL_THRESHOLD_MS env var.
  */
-function getStallThresholdMs(): number {
+export function getStallThresholdMs(): number {
 	const envVal = process.env.PI_TEAMS_STALL_THRESHOLD_MS;
 	if (envVal) {
 		const parsed = Number.parseInt(envVal, 10);

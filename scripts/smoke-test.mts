@@ -44,7 +44,7 @@ import {
 	shouldCreateHookFollowupTask,
 	shouldReopenTaskOnHookFailure,
 } from "../extensions/teams/hooks.js";
-import { TranscriptTracker, type TranscriptEntry } from "../extensions/teams/activity-tracker.js";
+import { ActivityTracker, TranscriptTracker, type TranscriptEntry } from "../extensions/teams/activity-tracker.js";
 import { listDiscoveredTeams } from "../extensions/teams/team-discovery.js";
 import {
 	acquireTeamAttachClaim,
@@ -53,6 +53,9 @@ import {
 	releaseTeamAttachClaim,
 } from "../extensions/teams/team-attach-claim.js";
 import { getTeamHelpText } from "../extensions/teams/leader-team-command.js";
+import { handleTeamCleanupCommand } from "../extensions/teams/leader-lifecycle-commands.js";
+import { registerTeamsTool } from "../extensions/teams/leader-teams-tool.js";
+import { startWaitPollLoop } from "../extensions/teams/wait-poll-loop.js";
 import { isTeamDone, formatElapsed, lastMessageSummary } from "../extensions/teams/teams-ui-shared.js";
 import {
 	TEAM_MAILBOX_NS,
@@ -68,10 +71,11 @@ import {
 	isPlanApprovedMessage,
 	isPlanRejectedMessage,
 } from "../extensions/teams/protocol.js";
-import { DelegationTracker, pollLeaderInbox } from "../extensions/teams/leader-inbox.js";
+import { DelegationTracker, TeamWaitTracker, formatTeamWaitWake, pollLeaderInbox } from "../extensions/teams/leader-inbox.js";
+import { PendingLeaderWakeQueue } from "../extensions/teams/pending-wake-queue.js";
 import { getParentSessionId, shouldSilenceInheritedParentAttachClaimWarning } from "../extensions/teams/session-parent.js";
 import { branchSelectionNote, ensureSessionFileMaterialized, resolveBranchLeafSelection } from "../extensions/teams/session-branching.js";
-import { SessionManager, type ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { SessionManager, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
 
 // ── helpers ──────────────────────────────────────────────────────────
@@ -1544,8 +1548,1039 @@ console.log("\n14. leader-inbox LLM message injection");
 	}
 }
 
-// ── 15. docs/help drift guard ────────────────────────────────────────
-console.log("\n15. docs/help drift guard");
+// ── 15. non-blocking wait tracker ───────────────────────────────────
+console.log("\n15. non-blocking wait tracker");
+{
+	const waitTracker = new TeamWaitTracker();
+	const teamId = "wait-team";
+	const taskListId = "wait-tl";
+	const name = "alice";
+	const now = 1_000_000;
+	const liveRpc = {
+		status: "streaming",
+		lastEventAt: now - 100,
+		lastError: null,
+	} as unknown as import("../extensions/teams/teammate-rpc.js").TeammateRpc;
+	const teammates = new Map([[name, liveRpc]]);
+
+	// Exercise the registered teams tool directly with the smallest possible Pi
+	// fixture. This keeps the action contract covered without starting a Pi RPC
+	// child process.
+	type CapturedTeamsTool = {
+		execute: (
+			toolCallId: string,
+			params: unknown,
+			signal: AbortSignal,
+			onUpdate: () => void,
+			ctx: ExtensionContext,
+		) => Promise<{ content: Array<{ type: string; text: string }>; details: unknown }>;
+	};
+	const capturedTeamsTool: { value: CapturedTeamsTool | null } = { value: null };
+	const actionWaitTracker = new TeamWaitTracker();
+	const actionTeamId = "wait-action-team";
+	const actionTaskListId = "wait-action-tl";
+	const terminalRpc = { ...liveRpc, name: "dave", status: "idle" } as unknown as import("../extensions/teams/teammate-rpc.js").TeammateRpc;
+	const actionTeammates = new Map<string, import("../extensions/teams/teammate-rpc.js").TeammateRpc>([
+		["alice", liveRpc],
+		["bob", { ...liveRpc, name: "bob" } as unknown as import("../extensions/teams/teammate-rpc.js").TeammateRpc],
+		["carol", { ...liveRpc, name: "carol" } as unknown as import("../extensions/teams/teammate-rpc.js").TeammateRpc],
+		["dave", terminalRpc],
+	]);
+	const savedActionTeamsRoot = process.env.PI_TEAMS_ROOT_DIR;
+	const savedActionStallThreshold = process.env.PI_TEAMS_STALL_THRESHOLD_MS;
+	let waitRegistrationInvalidations = 0;
+	process.env.PI_TEAMS_ROOT_DIR = tmpRoot;
+	try {
+		registerTeamsTool({
+			pi: {
+				registerTool: (tool: unknown) => {
+					capturedTeamsTool.value = tool as CapturedTeamsTool;
+				},
+			} as unknown as ExtensionAPI,
+			teammates: actionTeammates,
+			spawnTeammate: (async () => {
+				throw new Error("spawn is outside this wait-action fixture");
+			}) as unknown as import("../extensions/teams/spawn-types.js").SpawnTeammateFn,
+			getTeamId: () => actionTeamId,
+			getTaskListId: () => actionTaskListId,
+			getTracker: () => new ActivityTracker(),
+			getTeamConfig: () => null,
+			refreshTasks: async () => {},
+			renderWidget: () => {},
+			hideWidget: () => {},
+			stopAllTeammates: async () => {},
+			pendingPlanApprovals: new Map(),
+			waitTracker: actionWaitTracker,
+			beginWaitRegistration: () => { waitRegistrationInvalidations++; },
+		});
+		if (!capturedTeamsTool.value) throw new Error("teams tool was not registered");
+		const teamsTool = capturedTeamsTool.value;
+		const invokeWait = async (params: { name: string; stallThresholdMs?: number }) =>
+			await teamsTool.execute(
+				"wait-smoke",
+				{ action: "wait", ...params },
+				new AbortController().signal,
+				() => {},
+				{} as ExtensionContext,
+			);
+
+		delete process.env.PI_TEAMS_STALL_THRESHOLD_MS;
+		const defaultStartedAt = Date.now();
+		const defaultWait = await invokeWait({ name: "alice" });
+		const defaultDetails = isRecord(defaultWait.details) ? defaultWait.details : {};
+		assert(Date.now() - defaultStartedAt < 1_000, "wait action returns immediately after registering its monitor");
+		assertEq(defaultDetails.nonBlocking, true, "wait action marks its result as non-blocking");
+		assertEq(defaultDetails.stallThresholdMs, 300_000, "wait action defaults to a five-minute inactivity threshold");
+		assertEq(waitRegistrationInvalidations, 1, "wait action invalidates a retryable wake from the prior registration before registering");
+
+		process.env.PI_TEAMS_STALL_THRESHOLD_MS = "1234";
+		const envWait = await invokeWait({ name: "bob" });
+		const envDetails = isRecord(envWait.details) ? envWait.details : {};
+		assertEq(envDetails.stallThresholdMs, 1234, "wait action uses PI_TEAMS_STALL_THRESHOLD_MS when no override is supplied");
+
+		const overrideWait = await invokeWait({ name: "carol", stallThresholdMs: 321 });
+		const overrideDetails = isRecord(overrideWait.details) ? overrideWait.details : {};
+		assertEq(overrideDetails.stallThresholdMs, 321, "wait action lets stallThresholdMs override the environment");
+
+		const maxThresholdWait = await invokeWait({ name: "carol", stallThresholdMs: 1_800_000 });
+		const maxThresholdDetails = isRecord(maxThresholdWait.details) ? maxThresholdWait.details : {};
+		assertEq(maxThresholdDetails.stallThresholdMs, 1_800_000, "wait action accepts the 30-minute stall threshold boundary");
+
+		process.env.PI_TEAMS_STALL_THRESHOLD_MS = "1800000";
+		const maxEnvThresholdWait = await invokeWait({ name: "bob" });
+		const maxEnvThresholdDetails = isRecord(maxEnvThresholdWait.details) ? maxEnvThresholdWait.details : {};
+		assertEq(maxEnvThresholdDetails.stallThresholdMs, 1_800_000, "wait action accepts the 30-minute environment threshold boundary");
+
+		for (const invalidEnvThreshold of ["1800000.5", "2e6"]) {
+			process.env.PI_TEAMS_STALL_THRESHOLD_MS = invalidEnvThreshold;
+			const invalidEnvWait = await invokeWait({ name: "bob" });
+			const invalidEnvDetails = isRecord(invalidEnvWait.details) ? invalidEnvWait.details : {};
+			assertEq(invalidEnvDetails.status, "rejected", `wait action rejects non-integer environment threshold ${invalidEnvThreshold}`);
+			assertEq(invalidEnvDetails.reason, "invalid_environment_stall_threshold", `wait action reports invalid environment threshold ${invalidEnvThreshold}`);
+			assertEq(invalidEnvDetails.environmentValue, invalidEnvThreshold, `wait action preserves invalid environment threshold ${invalidEnvThreshold} in details`);
+		}
+
+		const tooLargeParamWait = await invokeWait({ name: "alice", stallThresholdMs: 1_800_001 });
+		const tooLargeParamDetails = isRecord(tooLargeParamWait.details) ? tooLargeParamWait.details : {};
+		assertEq(tooLargeParamDetails.status, "rejected", "wait action rejects a per-call threshold above thirty minutes");
+		assertEq(tooLargeParamDetails.reason, "stall_threshold_exceeds_maximum", "wait action reports the parameter threshold rejection reason");
+		assertEq(tooLargeParamDetails.stallThresholdSource, "params.stallThresholdMs", "wait action identifies an oversized parameter threshold");
+		assertEq(tooLargeParamDetails.maximumStallThresholdMs, 1_800_000, "wait action exposes the maximum parameter threshold");
+
+		process.env.PI_TEAMS_STALL_THRESHOLD_MS = "1800001";
+		const tooLargeEnvWait = await invokeWait({ name: "bob" });
+		const tooLargeEnvDetails = isRecord(tooLargeEnvWait.details) ? tooLargeEnvWait.details : {};
+		assertEq(tooLargeEnvDetails.status, "rejected", "wait action rejects an environment threshold above thirty minutes");
+		assertEq(tooLargeEnvDetails.reason, "stall_threshold_exceeds_maximum", "wait action reports the environment threshold rejection reason");
+		assertEq(tooLargeEnvDetails.stallThresholdSource, "PI_TEAMS_STALL_THRESHOLD_MS", "wait action identifies an oversized environment threshold");
+		delete process.env.PI_TEAMS_STALL_THRESHOLD_MS;
+
+		const terminalWait = await invokeWait({ name: "dave" });
+		const terminalDetails = isRecord(terminalWait.details) ? terminalWait.details : {};
+		assertEq(terminalDetails.status, "watching", "wait action registers a watch for an already-idle RPC teammate");
+		assertEq(terminalDetails.armedForNextRun, true, "already-idle wait is armed for the teammate's next run");
+		terminalRpc.status = "streaming";
+		terminalRpc.lastStatusChangeAt = Date.now();
+		terminalRpc.lastEventAt = Date.now();
+		assert(
+			actionWaitTracker.pollRpc(actionTeamId, actionTaskListId, actionTeammates).every((wake) => wake.name !== "dave"),
+			"armed idle wait observes the next run without waking immediately",
+		);
+
+		actionTeammates.delete("carol");
+		const unsupportedWait = await invokeWait({ name: "carol" });
+		const unsupportedDetails = isRecord(unsupportedWait.details) ? unsupportedWait.details : {};
+		assertEq(unsupportedDetails.status, "unsupported", "wait action rejects manual or unknown non-RPC teammates");
+	} finally {
+		if (savedActionTeamsRoot === undefined) delete process.env.PI_TEAMS_ROOT_DIR;
+		else process.env.PI_TEAMS_ROOT_DIR = savedActionTeamsRoot;
+		if (savedActionStallThreshold === undefined) delete process.env.PI_TEAMS_STALL_THRESHOLD_MS;
+		else process.env.PI_TEAMS_STALL_THRESHOLD_MS = savedActionStallThreshold;
+	}
+
+	assertEq(
+		waitTracker.register({ teamId, taskListId, name, stallThresholdMs: 500 }).replaced,
+		false,
+		"wait registration is new the first time",
+	);
+	assertEq(waitTracker.pollRpc(teamId, taskListId, teammates, now), [], "wait does not block or wake while RPC is active");
+	assertEq(
+		waitTracker.register({ teamId, taskListId, name, stallThresholdMs: 500 }).replaced,
+		true,
+		"repeat wait registration replaces the existing watch",
+	);
+	assertEq(
+		waitTracker.pollRpc(teamId, taskListId, teammates, now + 400),
+		[{ name, event: "stalled", stallThresholdMs: 500 }],
+		"wait wakes once when rolling inactivity reaches its configured threshold",
+	);
+	assertEq(waitTracker.pollRpc(teamId, taskListId, teammates, now + 10_000), [], "stalled wait is consumed after one wake");
+
+	const armedTracker = new TeamWaitTracker();
+	const armedRpc = {
+		...liveRpc,
+		status: "idle",
+		lastEventAt: now - 10_000,
+		lastStatusChangeAt: now - 10_000,
+	} as unknown as import("../extensions/teams/teammate-rpc.js").TeammateRpc;
+	const armedTeammates = new Map([[name, armedRpc]]);
+	armedTracker.register({
+		teamId,
+		taskListId,
+		name,
+		stallThresholdMs: 5_000,
+		registeredAt: now,
+		armedForNextRun: true,
+		rpcStatusChangeAtRegistration: armedRpc.lastStatusChangeAt,
+	});
+	assertEq(armedTracker.pollRpc(teamId, taskListId, armedTeammates, now + 4_999), [], "armed idle wait does not resolve from the pre-registration idle state");
+	assertEq(
+		armedTracker.pollRpc(teamId, taskListId, armedTeammates, now + 5_000),
+		[{ name, event: "stalled", stallThresholdMs: 5_000 }],
+		"armed idle wait wakes as stalled when its next run never starts",
+	);
+	assertEq(armedTracker.pollRpc(teamId, taskListId, armedTeammates, now + 10_000), [], "armed idle stall wakes exactly once");
+
+	const armedRunTracker = new TeamWaitTracker();
+	armedRunTracker.register({
+		teamId,
+		taskListId,
+		name,
+		stallThresholdMs: 5_000,
+		registeredAt: now,
+		armedForNextRun: true,
+		rpcStatusChangeAtRegistration: armedRpc.lastStatusChangeAt,
+	});
+	armedRpc.status = "streaming";
+	armedRpc.lastStatusChangeAt = now + 100;
+	armedRpc.lastEventAt = now + 100;
+	assertEq(armedRunTracker.pollRpc(teamId, taskListId, armedTeammates, now + 100), [], "armed wait transitions to watching when the next run starts");
+	armedRpc.status = "idle";
+	armedRpc.lastStatusChangeAt = now + 200;
+	assertEq(armedRunTracker.pollRpc(teamId, taskListId, armedTeammates, now + 200), [], "next-run idle begins stable-idle grace");
+	assertEq(armedRunTracker.pollRpc(teamId, taskListId, armedTeammates, now + 2_200), [{ name, event: "idle" }], "armed wait wakes once when the next run becomes idle");
+
+	const shortRunTracker = new TeamWaitTracker();
+	const shortRunBaseline = now + 20_000;
+	const shortRunRpc = { ...armedRpc, status: "idle", lastStatusChangeAt: shortRunBaseline } as unknown as import("../extensions/teams/teammate-rpc.js").TeammateRpc;
+	shortRunTracker.register({ teamId, taskListId, name, stallThresholdMs: 5_000, registeredAt: shortRunBaseline, armedForNextRun: true, rpcStatusChangeAtRegistration: shortRunBaseline });
+	shortRunRpc.lastStatusChangeAt = shortRunBaseline + 100;
+	assertEq(shortRunTracker.pollRpc(teamId, taskListId, new Map([[name, shortRunRpc]]), shortRunBaseline + 200), [], "a short run missed between polls is detected from its newer idle epoch");
+	assertEq(shortRunTracker.pollRpc(teamId, taskListId, new Map([[name, shortRunRpc]]), shortRunBaseline + 2_200), [{ name, event: "idle" }], "a short run missed between polls still wakes exactly once");
+
+	const armedInboxTracker = new TeamWaitTracker();
+	armedInboxTracker.register({ teamId, taskListId, name, stallThresholdMs: 5_000, registeredAt: now, armedForNextRun: true, rpcStatusChangeAtRegistration: now - 1 });
+	const oldArmedMarker = armedInboxTracker.recordIdleNotification(teamId, taskListId, name, new Date(now - 1).toISOString());
+	assertEq(armedInboxTracker.consumeIdleNotification({ teamId, taskListId, name, marker: oldArmedMarker }), { wake: null, completedTaskWatch: false, suppressCompletionNotification: false }, "delayed pre-registration idle does not consume an armed wait");
+	const nextRunMarker = armedInboxTracker.recordIdleNotification(teamId, taskListId, name, new Date(now + 1).toISOString());
+	assertEq(armedInboxTracker.consumeIdleNotification({ teamId, taskListId, name, marker: nextRunMarker }), { wake: { name, event: "idle" }, completedTaskWatch: false, suppressCompletionNotification: false }, "post-registration next-run idle resolves an armed wait");
+
+	// An idle notification claimed before the wait belongs to an older run. It
+	// must not resolve the new wait, which instead falls back to a stable RPC
+	// idle after the grace period.
+	const fallbackTracker = new TeamWaitTracker();
+	const priorIdleMarker = fallbackTracker.recordIdleNotification(teamId, taskListId, name);
+	fallbackTracker.register({ teamId, taskListId, name, stallThresholdMs: 5_000 });
+	assertEq(
+		fallbackTracker.consumeIdleNotification({ teamId, taskListId, name, marker: priorIdleMarker }),
+		{ wake: null, completedTaskWatch: false, suppressCompletionNotification: false },
+		"idle marker from before registration does not resolve a new worker run",
+	);
+	assertEq(
+		fallbackTracker.register({ teamId, taskListId, name, stallThresholdMs: 5_000 }).replaced,
+		true,
+		"old idle marker leaves the new wait registered",
+	);
+	const fallbackRpc = { ...liveRpc, status: "idle" } as unknown as import("../extensions/teams/teammate-rpc.js").TeammateRpc;
+	const fallbackTeammates = new Map([[name, fallbackRpc]]);
+	assertEq(fallbackTracker.pollRpc(teamId, taskListId, fallbackTeammates, now), [], "stable-idle fallback starts a grace period");
+	assertEq(
+		fallbackTracker.pollRpc(teamId, taskListId, fallbackTeammates, now + 2_000),
+		[{ name, event: "idle" }],
+		"missing or pre-registration idle mailbox resolves through stable RPC idle",
+	);
+	assertEq(fallbackTracker.pollRpc(teamId, taskListId, fallbackTeammates, now + 4_000), [], "stable-idle fallback wakes exactly once and clears the wait");
+
+	const transientIdleTracker = new TeamWaitTracker();
+	const transientRpc = { ...liveRpc, status: "idle" } as unknown as import("../extensions/teams/teammate-rpc.js").TeammateRpc;
+	const transientTeammates = new Map([[name, transientRpc]]);
+	transientIdleTracker.register({ teamId, taskListId, name, stallThresholdMs: 5_000 });
+	assertEq(transientIdleTracker.pollRpc(teamId, taskListId, transientTeammates, now), [], "transient idle begins but does not immediately wake");
+	transientRpc.status = "streaming";
+	transientRpc.lastEventAt = now + 1;
+	assertEq(transientIdleTracker.pollRpc(teamId, taskListId, transientTeammates, now + 1), [], "streaming recovery resets the idle grace period without waking");
+	transientRpc.status = "idle";
+	assertEq(transientIdleTracker.pollRpc(teamId, taskListId, transientTeammates, now + 2_500), [], "second idle transition starts a fresh grace period");
+	assertEq(
+		transientIdleTracker.pollRpc(teamId, taskListId, transientTeammates, now + 4_500),
+		[{ name, event: "idle" }],
+		"only the later stable idle resolves after a transient idle-to-streaming gap",
+	);
+
+	const skippedTransitionTracker = new TeamWaitTracker();
+	const skippedTransitionRpc = {
+		...liveRpc,
+		status: "idle",
+		lastStatusChangeAt: now,
+	} as unknown as import("../extensions/teams/teammate-rpc.js").TeammateRpc;
+	const skippedTransitionTeammates = new Map([[name, skippedTransitionRpc]]);
+	skippedTransitionTracker.register({ teamId, taskListId, name, stallThresholdMs: 5_000 });
+	assertEq(skippedTransitionTracker.pollRpc(teamId, taskListId, skippedTransitionTeammates, now), [], "first idle epoch starts a grace period");
+	// A streaming run can begin and end between refresh ticks. The current status
+	// is idle again, so lastStatusChangeAt is the only observable transition.
+	skippedTransitionRpc.lastStatusChangeAt = now + 1_000;
+	assertEq(skippedTransitionTracker.pollRpc(teamId, taskListId, skippedTransitionTeammates, now + 2_500), [], "a changed idle epoch restarts grace after an unobserved streaming gap");
+	assertEq(
+		skippedTransitionTracker.pollRpc(teamId, taskListId, skippedTransitionTeammates, now + 4_500),
+		[{ name, event: "idle" }],
+		"the replacement idle epoch wakes only after its own grace period",
+	);
+
+	const tombstoneTracker = new TeamWaitTracker();
+	const tombstoneRunStartedAt = now + 10_000;
+	const tombstoneRpc = {
+		...liveRpc,
+		status: "idle",
+		lastStatusChangeAt: tombstoneRunStartedAt + 100,
+	} as unknown as import("../extensions/teams/teammate-rpc.js").TeammateRpc;
+	tombstoneTracker.register({ teamId, taskListId, name, stallThresholdMs: 5_000, rpcRunStartedAt: tombstoneRunStartedAt });
+	assertEq(tombstoneTracker.pollRpc(teamId, taskListId, new Map([[name, tombstoneRpc]]), tombstoneRunStartedAt + 500), [], "fallback tombstone test starts idle grace");
+	assertEq(
+		tombstoneTracker.pollRpc(teamId, taskListId, new Map([[name, tombstoneRpc]]), tombstoneRunStartedAt + 2_500),
+		[{ name, event: "idle" }],
+		"fallback tombstone test resolves stable idle once",
+	);
+	const runBStartedAt = tombstoneRunStartedAt + 3_000;
+	tombstoneTracker.register({ teamId, taskListId, name, stallThresholdMs: 5_000, rpcRunStartedAt: runBStartedAt });
+	const delayedCompletionMarker = tombstoneTracker.recordIdleNotification(
+		teamId,
+		taskListId,
+		name,
+		new Date(tombstoneRunStartedAt + 200).toISOString(),
+	);
+	assertEq(
+		tombstoneTracker.consumeIdleNotification({ teamId, taskListId, name, completedTaskId: "delayed", marker: delayedCompletionMarker }),
+		{ wake: null, completedTaskWatch: false, suppressCompletionNotification: true },
+		"a delayed completion from fallback run A does not create a second leader turn or consume run B",
+	);
+	const runBIdleMarker = tombstoneTracker.recordIdleNotification(
+		teamId,
+		taskListId,
+		name,
+		new Date(runBStartedAt + 1).toISOString(),
+	);
+	assertEq(
+		tombstoneTracker.consumeIdleNotification({ teamId, taskListId, name, marker: runBIdleMarker }),
+		{ wake: { name, event: "idle" }, completedTaskWatch: false, suppressCompletionNotification: false },
+		"run B remains registered after a delayed completion from fallback run A",
+	);
+
+	// Fallback correlations are a bounded run history, rather than a single
+	// per-worker slot: B's fallback must not discard A's delayed completion.
+	const multiTombstoneTracker = new TeamWaitTracker();
+	const multiRunAStartedAt = now + 20_000;
+	const multiRunARpc = {
+		...liveRpc,
+		status: "idle",
+		lastStatusChangeAt: multiRunAStartedAt + 100,
+	} as unknown as import("../extensions/teams/teammate-rpc.js").TeammateRpc;
+	multiTombstoneTracker.register({ teamId, taskListId, name, stallThresholdMs: 5_000, rpcRunStartedAt: multiRunAStartedAt });
+	assertEq(multiTombstoneTracker.pollRpc(teamId, taskListId, new Map([[name, multiRunARpc]]), multiRunAStartedAt + 500), [], "multi-run tombstone A starts idle grace");
+	assertEq(multiTombstoneTracker.pollRpc(teamId, taskListId, new Map([[name, multiRunARpc]]), multiRunAStartedAt + 2_500), [{ name, event: "idle" }], "multi-run tombstone A resolves fallback");
+	const multiRunBStartedAt = multiRunAStartedAt + 3_000;
+	const multiRunBRpc = {
+		...liveRpc,
+		status: "idle",
+		lastStatusChangeAt: multiRunBStartedAt + 100,
+	} as unknown as import("../extensions/teams/teammate-rpc.js").TeammateRpc;
+	multiTombstoneTracker.register({ teamId, taskListId, name, stallThresholdMs: 5_000, rpcRunStartedAt: multiRunBStartedAt });
+	assertEq(multiTombstoneTracker.pollRpc(teamId, taskListId, new Map([[name, multiRunBRpc]]), multiRunBStartedAt + 500), [], "multi-run tombstone B starts idle grace");
+	assertEq(multiTombstoneTracker.pollRpc(teamId, taskListId, new Map([[name, multiRunBRpc]]), multiRunBStartedAt + 2_500), [{ name, event: "idle" }], "multi-run tombstone B resolves fallback");
+	const multiRunADelayedMarker = multiTombstoneTracker.recordIdleNotification(teamId, taskListId, name, new Date(multiRunAStartedAt + 200).toISOString());
+	assertEq(
+		multiTombstoneTracker.consumeIdleNotification({ teamId, taskListId, name, completedTaskId: "delayed-a", marker: multiRunADelayedMarker }),
+		{ wake: null, completedTaskWatch: false, suppressCompletionNotification: true },
+		"run A delayed completion remains suppressed after run B also used stable-idle fallback",
+	);
+	const multiRunBDelayedMarker = multiTombstoneTracker.recordIdleNotification(teamId, taskListId, name, new Date(multiRunBStartedAt + 200).toISOString());
+	assertEq(
+		multiTombstoneTracker.consumeIdleNotification({ teamId, taskListId, name, completedTaskId: "delayed-b", marker: multiRunBDelayedMarker }),
+		{ wake: null, completedTaskWatch: false, suppressCompletionNotification: true },
+		"run B delayed completion remains independently suppressed",
+	);
+
+	// An already-terminal registration only cancels its active watch. It must not
+	// erase a previous fallback tombstone that still owns a delayed completion.
+	const cancellationTracker = new TeamWaitTracker();
+	const cancellationRunAStartedAt = now + 30_000;
+	const cancellationRpc = {
+		...liveRpc,
+		status: "idle",
+		lastStatusChangeAt: cancellationRunAStartedAt + 100,
+	} as unknown as import("../extensions/teams/teammate-rpc.js").TeammateRpc;
+	cancellationTracker.register({ teamId, taskListId, name, stallThresholdMs: 5_000, rpcRunStartedAt: cancellationRunAStartedAt });
+	assertEq(cancellationTracker.pollRpc(teamId, taskListId, new Map([[name, cancellationRpc]]), cancellationRunAStartedAt + 500), [], "cancellation tombstone starts idle grace");
+	assertEq(cancellationTracker.pollRpc(teamId, taskListId, new Map([[name, cancellationRpc]]), cancellationRunAStartedAt + 2_500), [{ name, event: "idle" }], "cancellation tombstone resolves fallback");
+	cancellationTracker.register({ teamId, taskListId, name, stallThresholdMs: 5_000, rpcRunStartedAt: cancellationRunAStartedAt + 3_000 });
+	cancellationTracker.cancelWait(teamId, taskListId, name);
+	const cancellationDelayedMarker = cancellationTracker.recordIdleNotification(teamId, taskListId, name, new Date(cancellationRunAStartedAt + 200).toISOString());
+	assertEq(
+		cancellationTracker.consumeIdleNotification({ teamId, taskListId, name, completedTaskId: "cancelled-watch-delayed", marker: cancellationDelayedMarker }),
+		{ wake: null, completedTaskWatch: false, suppressCompletionNotification: true },
+		"cancelling an already-terminal wait preserves the prior fallback tombstone",
+	);
+
+	waitTracker.register({ teamId, taskListId, name, stallThresholdMs: 500 });
+	assertEq(
+		waitTracker.pollRpc(teamId, taskListId, new Map(), now),
+		[{ name, event: "closed" }],
+		"wait wakes when its RPC teammate closes",
+	);
+
+	const errorRpc = {
+		status: "error",
+		lastEventAt: now,
+		lastError: "worker process crashed",
+	} as unknown as import("../extensions/teams/teammate-rpc.js").TeammateRpc;
+	waitTracker.register({ teamId, taskListId, name, stallThresholdMs: 500 });
+	assertEq(
+		waitTracker.pollRpc(teamId, taskListId, new Map([[name, errorRpc]]), now),
+		[{ name, event: "failed", reason: "worker process crashed" }],
+		"wait reports an RPC error as failure instead of a normal close",
+	);
+
+	const idleRpc = {
+		status: "idle",
+		lastEventAt: now,
+		lastError: null,
+	} as unknown as import("../extensions/teams/teammate-rpc.js").TeammateRpc;
+	waitTracker.register({ teamId, taskListId, name, stallThresholdMs: 500 });
+	assertEq(waitTracker.pollRpc(teamId, taskListId, new Map([[name, idleRpc]]), now), [], "RPC idle fallback waits through its grace period");
+	assertEq(
+		waitTracker.pollRpc(teamId, taskListId, new Map([[name, idleRpc]]), now + 2_000),
+		[{ name, event: "idle" }],
+		"stable RPC idle wakes even if its mailbox notification is unavailable",
+	);
+
+	const preRegistrationMarker = waitTracker.recordIdleNotification(teamId, taskListId, name);
+	waitTracker.register({ teamId, taskListId, name, stallThresholdMs: 500 });
+	assertEq(
+		waitTracker.consumeIdleNotification({ teamId, taskListId, name, marker: preRegistrationMarker }),
+		{ wake: null, completedTaskWatch: false, suppressCompletionNotification: false },
+		"an inbox idle marker from before registration does not consume a newer wait",
+	);
+	const postRegistrationMarker = waitTracker.recordIdleNotification(teamId, taskListId, name);
+	assertEq(
+		waitTracker.consumeIdleNotification({ teamId, taskListId, name, marker: postRegistrationMarker }),
+		{ wake: { name, event: "idle" }, completedTaskWatch: false, suppressCompletionNotification: false },
+		"an inbox idle marker after registration resolves the wait",
+	);
+
+	const currentRunStartedAt = 20_000;
+	waitTracker.register({ teamId, taskListId, name, stallThresholdMs: 500, rpcRunStartedAt: currentRunStartedAt });
+	const delayedOldRunMarker = waitTracker.recordIdleNotification(
+		teamId,
+		taskListId,
+		name,
+		new Date(currentRunStartedAt - 1).toISOString(),
+	);
+	assertEq(
+		waitTracker.consumeIdleNotification({ teamId, taskListId, name, marker: delayedOldRunMarker }),
+		{ wake: null, completedTaskWatch: false, suppressCompletionNotification: false },
+		"a delayed idle notification from an older worker run does not consume a new streaming wait",
+	);
+	const currentRunIdleMarker = waitTracker.recordIdleNotification(
+		teamId,
+		taskListId,
+		name,
+		new Date(currentRunStartedAt + 1).toISOString(),
+	);
+	assertEq(
+		waitTracker.consumeIdleNotification({ teamId, taskListId, name, marker: currentRunIdleMarker }),
+		{ wake: { name, event: "idle" }, completedTaskWatch: false, suppressCompletionNotification: false },
+		"an idle notification from the current worker run resolves the wait",
+	);
+	assertEq(
+		formatTeamWaitWake("normal", { name, event: "closed" }),
+		"[Team] Wait ended: Teammate alice closed.",
+		"poll-derived close wake has a leader-deliverable message",
+	);
+	assertEq(
+		formatTeamWaitWake("normal", { name, event: "failed", reason: "worker process crashed" }),
+		"[Team] Wait ended: Teammate alice failed: worker process crashed",
+		"poll-derived failure wake has a leader-deliverable message",
+	);
+	const leaderSource = fs.readFileSync(path.join(process.cwd(), "extensions/teams/leader.ts"), "utf8");
+	assert(leaderSource.includes("for (const wake of waitTracker.pollRpc"), "leader wait loop polls stalled, closed, and failed waits");
+	assert(leaderSource.includes("wakeLeaderForWait(wake)"), "leader wait loop routes every poll-derived wake to delivery");
+	assert(leaderSource.includes("pi.sendUserMessage(wake.content"), "poll-derived wakes are injected into the leader conversation");
+	assert(leaderSource.includes("waitPollLoop = startWaitPollLoop"), "leader starts an independent wait liveness loop");
+	const refreshLoopStart = leaderSource.indexOf("refreshTimer = setInterval");
+	const waitLoopStart = leaderSource.indexOf("waitPollLoop = startWaitPollLoop");
+	assert(refreshLoopStart >= 0 && waitLoopStart > refreshLoopStart, "leader creates the wait liveness loop separately from refresh scheduling");
+	assert(!leaderSource.slice(refreshLoopStart, waitLoopStart).includes("pollWaits()"), "heartbeat/refresh loop no longer gates wait polling");
+	const sessionShutdownStart = leaderSource.indexOf('pi.on("session_shutdown"');
+	assert(sessionShutdownStart >= 0 && leaderSource.slice(sessionShutdownStart).includes("stopLoops();"), "session shutdown stops the independent wait liveness loop");
+	assert(!leaderSource.includes("await refreshTasks();\n\t\t\t\tpollWaits();"), "refresh loop no longer owns wait polling");
+	assert(leaderSource.includes("waitPollLoop = startWaitPollLoop"), "leader starts an independent wait polling loop");
+	assert(leaderSource.includes("waitPollLoop?.stop();"), "stopLoops clears the independent wait polling loop");
+	assert(leaderSource.includes("pendingWaitWakes.clear();"), "leader clears pending wake delivery on team/session scope changes");
+	assert(leaderSource.includes("wake.scopeEpoch !== waitWakeScopeEpoch"), "leader discards a late pending wake from an earlier scope before enqueueing it");
+	assert(leaderSource.includes("const pollMemberEpochs = new Map"), "inbox poll captures each member's wake epoch before handling messages");
+	assert(leaderSource.includes("wake.memberEpoch !== getMemberWaitWakeEpoch"), "late member wake enqueue is rejected after that member is killed");
+	assert(leaderSource.includes("clearMemberWaitState(teamId, effectiveTlId, name)"), "member kill clears that member's pending wait wake deliveries");
+	assert(leaderSource.includes("beginWaitRegistration: beginMemberWaitRegistration"), "new wait registrations invalidate retryable wakes from older registrations");
+	assert(leaderSource.includes("pendingWaitWakes.clearMember(teamId, effectiveTaskListId, name)"), "wait registration invalidation clears only that member's pending wakes");
+
+	// Terminal state is consumed before Pi accepts a leader message, so delivery
+	// must be retained, deduplicated, and retried without duplicating a turn.
+	const pendingWakeQueue = new PendingLeaderWakeQueue();
+	const pendingWake = {
+		key: "wait:wait-team:wait-tl:alice:idle",
+		teamId,
+		taskListId,
+		name,
+		scopeEpoch: 1,
+		memberEpoch: 0,
+		content: "[Team] Wait ended: Teammate alice is idle.",
+	};
+	assertEq(pendingWakeQueue.enqueue(pendingWake), true, "terminal wait wake enters the retry queue");
+	assertEq(pendingWakeQueue.enqueue(pendingWake), false, "duplicate terminal wait enqueue is suppressed while pending");
+	let piSendAttempts = 0;
+	const deliveredWaitWakes: string[] = [];
+	pendingWakeQueue.flush(() => {
+		piSendAttempts++;
+		throw new Error("Pi temporarily unavailable");
+	}, 10_000);
+	assertEq(pendingWakeQueue.size(), 1, "synchronous Pi send throw keeps terminal wake pending");
+	pendingWakeQueue.flush(() => {
+		piSendAttempts++;
+		deliveredWaitWakes.push(pendingWake.content);
+	}, 10_999);
+	assertEq(piSendAttempts, 1, "bounded backoff does not retry before the next tick window");
+	pendingWakeQueue.flush(() => {
+		piSendAttempts++;
+		deliveredWaitWakes.push(pendingWake.content);
+	}, 11_000);
+	assertEq(deliveredWaitWakes, [pendingWake.content], "next wait tick retries and delivers the terminal wake once");
+	assertEq(pendingWakeQueue.size(), 0, "successful Pi send removes the pending terminal wake");
+	pendingWakeQueue.flush(() => deliveredWaitWakes.push("duplicate"), 20_000);
+	assertEq(deliveredWaitWakes, [pendingWake.content], "delivered terminal wake is not sent twice");
+
+	const permanentlyFailingWake = { ...pendingWake, key: "wait:wait-team:wait-tl:alice:failed", content: "[Team] Wait ended: Teammate alice failed." };
+	const otherScopeWake = { ...pendingWake, key: "wait:other-team:wait-tl:alice:idle", teamId: "other-team" };
+	pendingWakeQueue.enqueue(permanentlyFailingWake);
+	pendingWakeQueue.enqueue(otherScopeWake);
+	pendingWakeQueue.flush(() => { throw new Error("Pi still unavailable"); }, 30_000);
+	pendingWakeQueue.flush(() => { throw new Error("Pi still unavailable"); }, 31_000);
+	assertEq(pendingWakeQueue.size(), 2, "repeated Pi send throws retain terminal wakes for later retry");
+	pendingWakeQueue.clearScope(teamId, taskListId);
+	assertEq(pendingWakeQueue.size(), 1, "team cleanup clears only its pending terminal wake deliveries");
+	pendingWakeQueue.clearScope("other-team");
+	assertEq(pendingWakeQueue.size(), 0, "scope cleanup can remove the remaining pending terminal wake delivery");
+
+	const lateScopeQueue = new PendingLeaderWakeQueue();
+	lateScopeQueue.enqueue({ ...pendingWake, key: "wait:old-scope", scopeEpoch: 7 });
+	const lateScopeDeliveries: string[] = [];
+	lateScopeQueue.flush(
+		(wake) => lateScopeDeliveries.push(wake.content),
+		40_000,
+		undefined,
+		(wake) => wake.scopeEpoch === 8,
+	);
+	assertEq(lateScopeDeliveries, [], "a late wake from an old team scope is discarded before delivery");
+	assertEq(lateScopeQueue.size(), 0, "discarding an old-scope wake removes it from the retry queue");
+
+	const lateMemberQueue = new PendingLeaderWakeQueue();
+	lateMemberQueue.enqueue({ ...pendingWake, key: "wait:killed-alice", memberEpoch: 3 });
+	lateMemberQueue.enqueue({ ...pendingWake, key: "wait:live-bob", name: "bob", content: "bob wake" });
+	const lateMemberDeliveries: string[] = [];
+	lateMemberQueue.flush(
+		(wake) => lateMemberDeliveries.push(wake.content),
+		45_000,
+		undefined,
+		(wake) => wake.name !== name || wake.memberEpoch === 4,
+	);
+	assertEq(lateMemberDeliveries, ["bob wake"], "late enqueue from killed member is discarded while another member wake remains deliverable");
+	assertEq(lateMemberQueue.size(), 0, "member-epoch filtering consumes both discarded and delivered entries");
+
+	const runIdentityTracker = new TeamWaitTracker();
+	runIdentityTracker.register({ teamId, taskListId, name, stallThresholdMs: 5_000 });
+	const firstRunWake = runIdentityTracker.pollRpc(teamId, taskListId, new Map(), now)[0];
+	runIdentityTracker.register({ teamId, taskListId, name, stallThresholdMs: 5_000 });
+	const secondRunWake = runIdentityTracker.pollRpc(teamId, taskListId, new Map(), now + 1)[0];
+	assert(firstRunWake?.terminalId !== undefined && secondRunWake?.terminalId !== undefined && firstRunWake.terminalId !== secondRunWake.terminalId, "identical terminal conditions from distinct wait runs receive distinct ids");
+	const distinctRunQueue = new PendingLeaderWakeQueue();
+	assertEq(distinctRunQueue.enqueue({ ...pendingWake, key: `wait:${firstRunWake?.terminalId ?? "missing"}` }), true, "first run terminal wake enters the retry queue");
+	assertEq(distinctRunQueue.enqueue({ ...pendingWake, key: `wait:${secondRunWake?.terminalId ?? "missing"}` }), true, "same terminal condition from a later run is not deduplicated with the earlier run");
+	const rewaitQueue = new PendingLeaderWakeQueue();
+	rewaitQueue.enqueue({ ...pendingWake, key: "wait:old-registration", memberEpoch: 4 });
+	rewaitQueue.clearMember(teamId, taskListId, name);
+	let oldRegistrationDeliveries = 0;
+	rewaitQueue.flush(() => { oldRegistrationDeliveries++; }, 20_000, undefined, (wake) => wake.memberEpoch === 5);
+	assertEq(oldRegistrationDeliveries, 0, "re-registering a member wait prevents its queued old terminal wake from being delivered");
+
+	const killCleanupQueue = new PendingLeaderWakeQueue();
+	killCleanupQueue.enqueue({ ...pendingWake, key: "wait:kill-alice" });
+	killCleanupQueue.enqueue({ ...pendingWake, key: "wait:kill-bob", name: "bob" });
+	killCleanupQueue.clearMember(teamId, taskListId, name);
+	assertEq(killCleanupQueue.size(), 1, "member kill cleanup removes only that member's pending wakes");
+	killCleanupQueue.clearMember(teamId, taskListId, "bob");
+	assertEq(killCleanupQueue.size(), 0, "member kill cleanup removes the remaining member wake");
+
+	// A refresh cycle can be held forever by attach-claim I/O. The separate wait
+	// timer still runs, is unref'd, and does not overlap its own slow poll.
+	let scheduledWaitTick: (() => void) | undefined;
+	let waitTimerUnrefCalls = 0;
+	let waitTimerCancelCalls = 0;
+	let independentWaitPolls = 0;
+	let releaseSlowPoll: (() => void) | undefined;
+	const slowWaitPoll = new Promise<void>((resolve) => {
+		releaseSlowPoll = resolve;
+	});
+	const heartbeatNeverResolves = new Promise<void>(() => {});
+	void heartbeatNeverResolves;
+	const heartbeatRejects = Promise.reject(new Error("attach heartbeat failed"));
+	void heartbeatRejects.catch(() => {});
+	const waitLoop = startWaitPollLoop({
+		poll: async () => {
+			independentWaitPolls++;
+			if (independentWaitPolls === 1) await slowWaitPoll;
+		},
+		schedule: (callback) => {
+			scheduledWaitTick = callback;
+			return { unref: () => { waitTimerUnrefCalls++; } };
+		},
+		cancel: () => { waitTimerCancelCalls++; },
+	});
+	assertEq(waitTimerUnrefCalls, 1, "independent wait timer is unref'd");
+	scheduledWaitTick?.();
+	await Promise.resolve();
+	await Promise.resolve();
+	assertEq(independentWaitPolls, 1, "wait poll proceeds while simulated heartbeat work never resolves or rejects");
+	scheduledWaitTick?.();
+	await Promise.resolve();
+	assertEq(independentWaitPolls, 1, "independent wait poll prevents overlapping ticks");
+	releaseSlowPoll?.();
+	await new Promise<void>((resolve) => setImmediate(resolve));
+	scheduledWaitTick?.();
+	await new Promise<void>((resolve) => setImmediate(resolve));
+	assertEq(independentWaitPolls, 2, "independent wait poll resumes after its in-flight tick completes");
+	waitLoop.stop();
+	scheduledWaitTick?.();
+	await new Promise<void>((resolve) => setImmediate(resolve));
+	assertEq(waitTimerCancelCalls, 1, "stopping loops cancels the independent wait timer");
+	assertEq(independentWaitPolls, 2, "stopped independent wait timer cannot poll again");
+
+	// /team cleanup deletes the mailbox/task artifacts that waits rely on, so its
+	// callback must cancel waits before it removes the team directory.
+	const savedTeamsRoot = process.env.PI_TEAMS_ROOT_DIR;
+	const cleanupTeamsRoot = tmpRoot;
+	const cleanupTeamId = "cleanup-watches-team";
+	process.env.PI_TEAMS_ROOT_DIR = cleanupTeamsRoot;
+	try {
+		await fs.promises.mkdir(path.join(cleanupTeamsRoot, cleanupTeamId), { recursive: true });
+		waitTracker.register({ teamId, taskListId, name, stallThresholdMs: 500 });
+		let cleanupWaitsCleared = 0;
+		await handleTeamCleanupCommand({
+			ctx: {
+				cwd: tmpRoot,
+				ui: { notify: () => {} },
+			} as unknown as import("@earendil-works/pi-coding-agent").ExtensionCommandContext,
+			rest: ["--force"],
+			teamId: cleanupTeamId,
+			teammates: new Map(),
+			clearWaits: () => {
+				cleanupWaitsCleared++;
+				waitTracker.clear();
+			},
+			refreshTasks: async () => {},
+			getTasks: () => [],
+			renderWidget: () => {},
+			style: "normal",
+		});
+		assertEq(cleanupWaitsCleared, 1, "forced cleanup clears active waits before deleting artifacts");
+		assertEq(waitTracker.pollRpc(teamId, taskListId, teammates, now), [], "cleanup-cleared wait cannot wake later");
+	} finally {
+		if (savedTeamsRoot === undefined) delete process.env.PI_TEAMS_ROOT_DIR;
+		else process.env.PI_TEAMS_ROOT_DIR = savedTeamsRoot;
+	}
+
+	waitTracker.register({ teamId, taskListId, name, stallThresholdMs: 500 });
+	assertEq(
+		waitTracker.handleIdleNotification({ teamId, taskListId, name }),
+		{ name, event: "idle" },
+		"wait wakes on an idle notification",
+	);
+	waitTracker.register({ teamId, taskListId, name, stallThresholdMs: 500 });
+	assertEq(
+		waitTracker.handleIdleNotification({ teamId, taskListId, name, failureReason: "worker shutdown" }),
+		{ name, event: "failed", reason: "worker shutdown" },
+		"wait wakes on a worker failure notification",
+	);
+	assertEq(
+		formatTeamWaitWake("normal", { name, event: "stalled", stallThresholdMs: 300_000 }),
+		"[Team] Wait ended: Teammate alice appears stalled (no agent events for 300s).",
+		"wait wake formatting describes the stalled condition",
+	);
+
+	// Verify mailbox-driven wakes are delivered to the leader asynchronously.
+	const waitInboxDir = path.join(tmpRoot, "wait-inbox-test");
+	const waitInboxTeamId = "wait-inbox-team";
+	const waitInboxTaskListId = "wait-inbox-tl";
+	await ensureTeamConfig(waitInboxDir, {
+		teamId: waitInboxTeamId,
+		taskListId: waitInboxTaskListId,
+		leadName: "team-lead",
+		style: "normal",
+	});
+	const wakeMessages: Array<{ content: string; options?: { deliverAs?: string } }> = [];
+	let leaderIsIdle = false;
+	const wakeCtx = {
+		cwd: waitInboxDir,
+		ui: { notify: () => {} },
+		sessionManager: { getSessionId: () => waitInboxTeamId },
+		isIdle: () => leaderIsIdle,
+	} as unknown as ExtensionContext;
+	const inboxWaitTracker = new TeamWaitTracker();
+	const delayedRunTracker = new TeamWaitTracker();
+	const delayedRunStartedAt = Date.now();
+	delayedRunTracker.register({
+		teamId: waitInboxTeamId,
+		taskListId: waitInboxTaskListId,
+		name,
+		stallThresholdMs: 5_000,
+		rpcRunStartedAt: delayedRunStartedAt,
+	});
+	const delayedOldRunTimestamp = new Date(delayedRunStartedAt - 1).toISOString();
+	await writeToMailbox(waitInboxDir, TEAM_MAILBOX_NS, "team-lead", {
+		from: name,
+		text: JSON.stringify({ type: "idle_notification", from: name, timestamp: delayedOldRunTimestamp }),
+		timestamp: delayedOldRunTimestamp,
+	});
+	await pollLeaderInbox({
+		ctx: wakeCtx,
+		teamId: waitInboxTeamId,
+		teamDir: waitInboxDir,
+		taskListId: waitInboxTaskListId,
+		leadName: "team-lead",
+		style: "normal",
+		pendingPlanApprovals: new Map(),
+		waitTracker: delayedRunTracker,
+		sendLeaderLlmMessage: (content, options) => wakeMessages.push({ content, options }),
+	});
+	assertEq(wakeMessages.length, 0, "a delayed old-run idle notification claimed after registration does not wake the new run");
+	const currentRunTimestamp = new Date(delayedRunStartedAt + 1).toISOString();
+	await writeToMailbox(waitInboxDir, TEAM_MAILBOX_NS, "team-lead", {
+		from: name,
+		text: JSON.stringify({ type: "idle_notification", from: name, timestamp: currentRunTimestamp }),
+		timestamp: currentRunTimestamp,
+	});
+	await pollLeaderInbox({
+		ctx: wakeCtx,
+		teamId: waitInboxTeamId,
+		teamDir: waitInboxDir,
+		taskListId: waitInboxTaskListId,
+		leadName: "team-lead",
+		style: "normal",
+		pendingPlanApprovals: new Map(),
+		waitTracker: delayedRunTracker,
+		sendLeaderLlmMessage: (content, options) => wakeMessages.push({ content, options }),
+	});
+	assertEq(wakeMessages.length, 1, "a current-run idle notification claimed after registration wakes once");
+	wakeMessages.length = 0;
+
+	// An inbox poll can consume an idle marker before a later wait action is
+	// registered. That older marker must be ignored, while the stable RPC-idle
+	// fallback still guarantees a finite, one-time resolution.
+	const preWatchIdleTimestamp = new Date().toISOString();
+	await writeToMailbox(waitInboxDir, TEAM_MAILBOX_NS, "team-lead", {
+		from: name,
+		text: JSON.stringify({ type: "idle_notification", from: name, timestamp: preWatchIdleTimestamp }),
+		timestamp: preWatchIdleTimestamp,
+	});
+	await pollLeaderInbox({
+		ctx: wakeCtx,
+		teamId: waitInboxTeamId,
+		teamDir: waitInboxDir,
+		taskListId: waitInboxTaskListId,
+		leadName: "team-lead",
+		style: "normal",
+		pendingPlanApprovals: new Map(),
+		waitTracker: inboxWaitTracker,
+		sendLeaderLlmMessage: (content, options) => wakeMessages.push({ content, options }),
+	});
+	assertEq(wakeMessages.length, 0, "an idle notification consumed before registration cannot wake a later wait");
+	inboxWaitTracker.register({ teamId: waitInboxTeamId, taskListId: waitInboxTaskListId, name, stallThresholdMs: 5_000 });
+	const preWatchIdleRpc = { ...liveRpc, status: "idle" } as unknown as import("../extensions/teams/teammate-rpc.js").TeammateRpc;
+	const preWatchIdleTeammates = new Map([[name, preWatchIdleRpc]]);
+	assertEq(inboxWaitTracker.pollRpc(waitInboxTeamId, waitInboxTaskListId, preWatchIdleTeammates, now), [], "pre-registration mailbox idle begins stable RPC fallback");
+	assertEq(
+		inboxWaitTracker.pollRpc(waitInboxTeamId, waitInboxTaskListId, preWatchIdleTeammates, now + 2_000),
+		[{ name, event: "idle" }],
+		"pre-registration mailbox idle resolves once through the stable RPC fallback",
+	);
+	assertEq(inboxWaitTracker.pollRpc(waitInboxTeamId, waitInboxTaskListId, preWatchIdleTeammates, now + 4_000), [], "fallback resolution clears its watch after one wake");
+
+	inboxWaitTracker.register({ teamId: waitInboxTeamId, taskListId: waitInboxTaskListId, name, stallThresholdMs: 500 });
+	const idleTimestamp = new Date().toISOString();
+	await writeToMailbox(waitInboxDir, TEAM_MAILBOX_NS, "team-lead", {
+		from: name,
+		text: JSON.stringify({ type: "idle_notification", from: name, timestamp: idleTimestamp }),
+		timestamp: idleTimestamp,
+	});
+	await pollLeaderInbox({
+		ctx: wakeCtx,
+		teamId: waitInboxTeamId,
+		teamDir: waitInboxDir,
+		taskListId: waitInboxTaskListId,
+		leadName: "team-lead",
+		style: "normal",
+		pendingPlanApprovals: new Map(),
+		waitTracker: inboxWaitTracker,
+		sendLeaderLlmMessage: (content, options) => wakeMessages.push({ content, options }),
+	});
+	assertEq(wakeMessages.length, 1, "idle wait sends one asynchronous leader wake");
+	assert(wakeMessages[0]?.content.includes("Wait ended: Teammate alice is idle") === true, "idle wait wake identifies the teammate and event");
+	assertEq(wakeMessages[0]?.options?.deliverAs, "followUp", "busy leader receives a wait wake as follow-up");
+
+	leaderIsIdle = true;
+	inboxWaitTracker.register({ teamId: waitInboxTeamId, taskListId: waitInboxTaskListId, name, stallThresholdMs: 500 });
+	const idleLeaderTimestamp = new Date().toISOString();
+	await writeToMailbox(waitInboxDir, TEAM_MAILBOX_NS, "team-lead", {
+		from: name,
+		text: JSON.stringify({ type: "idle_notification", from: name, timestamp: idleLeaderTimestamp }),
+		timestamp: idleLeaderTimestamp,
+	});
+	wakeMessages.length = 0;
+	await pollLeaderInbox({
+		ctx: wakeCtx,
+		teamId: waitInboxTeamId,
+		teamDir: waitInboxDir,
+		taskListId: waitInboxTaskListId,
+		leadName: "team-lead",
+		style: "normal",
+		pendingPlanApprovals: new Map(),
+		waitTracker: inboxWaitTracker,
+		sendLeaderLlmMessage: (content, options) => wakeMessages.push({ content, options }),
+	});
+	assertEq(wakeMessages.length, 1, "idle leader receives one wait wake as a new turn");
+	assertEq(wakeMessages[0]?.options, undefined, "idle leader wait wake has no delivery override");
+
+	const watchedCompletion = await createTask(waitInboxDir, waitInboxTaskListId, { subject: "Watched completion", description: "", owner: name });
+	await completeTask(waitInboxDir, waitInboxTaskListId, watchedCompletion.id, name, "done");
+	inboxWaitTracker.register({ teamId: waitInboxTeamId, taskListId: waitInboxTaskListId, name, stallThresholdMs: 500 });
+	const watchedCompletionTimestamp = new Date().toISOString();
+	await writeToMailbox(waitInboxDir, TEAM_MAILBOX_NS, "team-lead", {
+		from: name,
+		text: JSON.stringify({
+			type: "idle_notification",
+			from: name,
+			timestamp: watchedCompletionTimestamp,
+			completedTaskId: watchedCompletion.id,
+			completedStatus: "completed",
+		}),
+		timestamp: watchedCompletionTimestamp,
+	});
+	wakeMessages.length = 0;
+	await pollLeaderInbox({
+		ctx: wakeCtx,
+		teamId: waitInboxTeamId,
+		teamDir: waitInboxDir,
+		taskListId: waitInboxTaskListId,
+		leadName: "team-lead",
+		style: "normal",
+		pendingPlanApprovals: new Map(),
+		waitTracker: inboxWaitTracker,
+		sendLeaderLlmMessage: (content, options) => wakeMessages.push({ content, options }),
+	});
+	assertEq(wakeMessages.length, 1, "watched task completion reuses one existing completion message");
+	assert(wakeMessages[0]?.content.includes(`completed task #${watchedCompletion.id}`) === true, "watched completion keeps the established completion content");
+	assertEq(wakeMessages[0]?.options, undefined, "watched completion wakes an idle leader as a new turn");
+	await pollLeaderInbox({
+		ctx: wakeCtx,
+		teamId: waitInboxTeamId,
+		teamDir: waitInboxDir,
+		taskListId: waitInboxTaskListId,
+		leadName: "team-lead",
+		style: "normal",
+		pendingPlanApprovals: new Map(),
+		waitTracker: inboxWaitTracker,
+		sendLeaderLlmMessage: (content, options) => wakeMessages.push({ content, options }),
+	});
+	assertEq(wakeMessages.length, 1, "a consumed completion notification cannot wake the leader twice");
+
+	leaderIsIdle = false;
+	const watchedBusyCompletion = await createTask(waitInboxDir, waitInboxTaskListId, { subject: "Busy watched completion", description: "", owner: name });
+	await completeTask(waitInboxDir, waitInboxTaskListId, watchedBusyCompletion.id, name, "done while leader is busy");
+	inboxWaitTracker.register({ teamId: waitInboxTeamId, taskListId: waitInboxTaskListId, name, stallThresholdMs: 500 });
+	const watchedBusyCompletionTimestamp = new Date().toISOString();
+	await writeToMailbox(waitInboxDir, TEAM_MAILBOX_NS, "team-lead", {
+		from: name,
+		text: JSON.stringify({
+			type: "idle_notification",
+			from: name,
+			timestamp: watchedBusyCompletionTimestamp,
+			completedTaskId: watchedBusyCompletion.id,
+			completedStatus: "completed",
+		}),
+		timestamp: watchedBusyCompletionTimestamp,
+	});
+	wakeMessages.length = 0;
+	await pollLeaderInbox({
+		ctx: wakeCtx,
+		teamId: waitInboxTeamId,
+		teamDir: waitInboxDir,
+		taskListId: waitInboxTaskListId,
+		leadName: "team-lead",
+		style: "normal",
+		pendingPlanApprovals: new Map(),
+		waitTracker: inboxWaitTracker,
+		sendLeaderLlmMessage: (content, options) => wakeMessages.push({ content, options }),
+	});
+	assertEq(wakeMessages.length, 1, "watched task completion sends one message while the leader is busy");
+	assertEq(wakeMessages[0]?.options?.deliverAs, "followUp", "watched completion is delivered as a follow-up while the leader is busy");
+
+	const fallbackInboxTracker = new TeamWaitTracker();
+	const fallbackRunStartedAt = Date.now();
+	const fallbackInboxRpc = {
+		status: "idle",
+		lastEventAt: fallbackRunStartedAt,
+		lastStatusChangeAt: fallbackRunStartedAt,
+		lastError: null,
+	} as unknown as import("../extensions/teams/teammate-rpc.js").TeammateRpc;
+	fallbackInboxTracker.register({
+		teamId: waitInboxTeamId,
+		taskListId: waitInboxTaskListId,
+		name,
+		stallThresholdMs: 500,
+		rpcRunStartedAt: fallbackRunStartedAt,
+	});
+	assertEq(fallbackInboxTracker.pollRpc(waitInboxTeamId, waitInboxTaskListId, new Map([[name, fallbackInboxRpc]]), fallbackRunStartedAt), [], "fallback inbox test begins stable-idle grace");
+	assertEq(
+		fallbackInboxTracker.pollRpc(waitInboxTeamId, waitInboxTaskListId, new Map([[name, fallbackInboxRpc]]), fallbackRunStartedAt + 2_000),
+		[{ name, event: "idle" }],
+		"fallback inbox test resolves the wait before delayed mailbox delivery",
+	);
+	const delayedFallbackCompletion = await createTask(waitInboxDir, waitInboxTaskListId, { subject: "Delayed fallback completion", description: "", owner: name });
+	await completeTask(waitInboxDir, waitInboxTaskListId, delayedFallbackCompletion.id, name, "done");
+	const delayedFallbackTimestamp = new Date(fallbackRunStartedAt + 100).toISOString();
+	await writeToMailbox(waitInboxDir, TEAM_MAILBOX_NS, "team-lead", {
+		from: name,
+		text: JSON.stringify({
+			type: "idle_notification",
+			from: name,
+			timestamp: delayedFallbackTimestamp,
+			completedTaskId: delayedFallbackCompletion.id,
+			completedStatus: "completed",
+		}),
+		timestamp: delayedFallbackTimestamp,
+	});
+	wakeMessages.length = 0;
+	await pollLeaderInbox({
+		ctx: wakeCtx,
+		teamId: waitInboxTeamId,
+		teamDir: waitInboxDir,
+		taskListId: waitInboxTaskListId,
+		leadName: "team-lead",
+		style: "normal",
+		pendingPlanApprovals: new Map(),
+		waitTracker: fallbackInboxTracker,
+		sendLeaderLlmMessage: (content, options) => wakeMessages.push({ content, options }),
+	});
+	assertEq(wakeMessages.length, 0, "a delayed completion for a stable-idle fallback run does not create a duplicate leader turn");
+
+	// A suppression must still advance the delegation batch; otherwise a later
+	// batch would be permanently blocked behind a completion that was hidden only
+	// to avoid duplicating the fallback wake.
+	leaderIsIdle = false;
+	const suppressedBatchTracker = new DelegationTracker();
+	const batchWaitTracker = new TeamWaitTracker();
+	const batchFirst = await createTask(waitInboxDir, waitInboxTaskListId, { subject: "Suppressed batch first", description: "", owner: name });
+	const batchSecond = await createTask(waitInboxDir, waitInboxTaskListId, { subject: "Suppressed batch second", description: "", owner: name });
+	await completeTask(waitInboxDir, waitInboxTaskListId, batchFirst.id, name, "first");
+	await completeTask(waitInboxDir, waitInboxTaskListId, batchSecond.id, name, "second");
+	suppressedBatchTracker.addBatch([batchFirst.id, batchSecond.id]);
+	const batchFirstTimestamp = new Date().toISOString();
+	await writeToMailbox(waitInboxDir, TEAM_MAILBOX_NS, "team-lead", {
+		from: name,
+		text: JSON.stringify({ type: "idle_notification", from: name, timestamp: batchFirstTimestamp, completedTaskId: batchFirst.id, completedStatus: "completed" }),
+		timestamp: batchFirstTimestamp,
+	});
+	wakeMessages.length = 0;
+	await pollLeaderInbox({
+		ctx: wakeCtx,
+		teamId: waitInboxTeamId,
+		teamDir: waitInboxDir,
+		taskListId: waitInboxTaskListId,
+		leadName: "team-lead",
+		style: "normal",
+		pendingPlanApprovals: new Map(),
+		waitTracker: batchWaitTracker,
+		delegationTracker: suppressedBatchTracker,
+		sendLeaderLlmMessage: (content, options) => wakeMessages.push({ content, options }),
+	});
+	const batchFallbackRunStartedAt = Date.now();
+	const batchFallbackRpc = {
+		status: "idle",
+		lastEventAt: batchFallbackRunStartedAt,
+		lastStatusChangeAt: batchFallbackRunStartedAt,
+		lastError: null,
+	} as unknown as import("../extensions/teams/teammate-rpc.js").TeammateRpc;
+	batchWaitTracker.register({ teamId: waitInboxTeamId, taskListId: waitInboxTaskListId, name, stallThresholdMs: 500, rpcRunStartedAt: batchFallbackRunStartedAt });
+	batchWaitTracker.pollRpc(waitInboxTeamId, waitInboxTaskListId, new Map([[name, batchFallbackRpc]]), batchFallbackRunStartedAt);
+	batchWaitTracker.pollRpc(waitInboxTeamId, waitInboxTaskListId, new Map([[name, batchFallbackRpc]]), batchFallbackRunStartedAt + 2_000);
+	const batchSecondTimestamp = new Date(batchFallbackRunStartedAt + 100).toISOString();
+	await writeToMailbox(waitInboxDir, TEAM_MAILBOX_NS, "team-lead", {
+		from: name,
+		text: JSON.stringify({ type: "idle_notification", from: name, timestamp: batchSecondTimestamp, completedTaskId: batchSecond.id, completedStatus: "completed" }),
+		timestamp: batchSecondTimestamp,
+	});
+	wakeMessages.length = 0;
+	await pollLeaderInbox({
+		ctx: wakeCtx,
+		teamId: waitInboxTeamId,
+		teamDir: waitInboxDir,
+		taskListId: waitInboxTaskListId,
+		leadName: "team-lead",
+		style: "normal",
+		pendingPlanApprovals: new Map(),
+		waitTracker: batchWaitTracker,
+		delegationTracker: suppressedBatchTracker,
+		sendLeaderLlmMessage: (content, options) => wakeMessages.push({ content, options }),
+	});
+	assertEq(wakeMessages.length, 0, "a suppressed final batch completion does not emit a duplicate completion or batch turn");
+	const subsequentBatch = await createTask(waitInboxDir, waitInboxTaskListId, { subject: "Subsequent batch", description: "", owner: name });
+	await completeTask(waitInboxDir, waitInboxTaskListId, subsequentBatch.id, name, "later");
+	suppressedBatchTracker.addBatch([subsequentBatch.id]);
+	const subsequentBatchTimestamp = new Date().toISOString();
+	await writeToMailbox(waitInboxDir, TEAM_MAILBOX_NS, "team-lead", {
+		from: name,
+		text: JSON.stringify({ type: "idle_notification", from: name, timestamp: subsequentBatchTimestamp, completedTaskId: subsequentBatch.id, completedStatus: "completed" }),
+		timestamp: subsequentBatchTimestamp,
+	});
+	wakeMessages.length = 0;
+	await pollLeaderInbox({
+		ctx: wakeCtx,
+		teamId: waitInboxTeamId,
+		teamDir: waitInboxDir,
+		taskListId: waitInboxTaskListId,
+		leadName: "team-lead",
+		style: "normal",
+		pendingPlanApprovals: new Map(),
+		waitTracker: batchWaitTracker,
+		delegationTracker: suppressedBatchTracker,
+		sendLeaderLlmMessage: (content, options) => wakeMessages.push({ content, options }),
+	});
+	assert(
+		wakeMessages.some((message) => message.content.includes(`All delegated tasks completed (#${subsequentBatch.id})`)),
+		"a batch after suppressed completion still completes and notifies the leader",
+	);
+
+}
+
+// ── 16. docs/help drift guard ────────────────────────────────────────
+console.log("\n16. docs/help drift guard");
 {
 	const help = getTeamHelpText();
 	assert(help.includes("/team done"), "help mentions /team done");
@@ -1592,6 +2627,17 @@ console.log("\n15. docs/help drift guard");
 		assert(readme.includes("/team cleanup"), "README mentions /team cleanup command");
 		assert(readme.includes("docs/hook-contract.md"), "README references hook contract doc");
 		assert(readme.includes("member_status"), "README mentions teams tool member_status action");
+		assert(readme.includes("\"action\": \"wait\""), "README mentions teams tool wait action");
+		assert(readme.includes("Non-blocking teammate wait"), "README documents non-blocking teammate waits");
+		assert(readme.includes("rolling five-minute inactivity window"), "README documents wait inactivity semantics");
+		assert(readme.includes("stallThresholdMs"), "README documents the per-wait stall threshold override");
+		assert(readme.includes("positive decimal-integer string"), "README documents the strict wait environment threshold format");
+		assert(readme.includes("1800000.5") && readme.includes("2e6"), "README documents rejected fractional and exponent environment thresholds");
+		assert(readme.includes("stable RPC idle"), "README documents the bounded stable-idle fallback");
+		assert(readme.includes("instead of waiting forever"), "README documents prevention of indefinite wait registrations");
+		assert(readme.includes("own lightweight loop"), "README documents independent wait monitoring liveness");
+		assert(readme.includes("queued and retried"), "README documents retry of temporarily undeliverable wait wakes");
+		assert(readme.includes("earlier team/task scope"), "README documents discarding old-scope wait wakes");
 		assert(readme.includes("/team status"), "README mentions /team status command");
 		assert(readme.includes("PI_TEAMS_STALL_THRESHOLD_MS"), "README mentions stall threshold env var");
 		assert(readme.includes("Stall detection"), "README mentions stall detection feature");

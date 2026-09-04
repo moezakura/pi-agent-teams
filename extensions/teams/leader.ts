@@ -19,7 +19,7 @@ import { isTeamDone } from "./teams-ui-shared.js";
 import { createTeamsWidget } from "./teams-widget.js";
 import { resolveTeammateModelSelection, formatProviderModel } from "./model-policy.js";
 import { getTeamsStyleFromEnv, type TeamsStyle, formatMemberDisplayName, getTeamsStrings } from "./teams-style.js";
-import { DelegationTracker, pollLeaderInbox as pollLeaderInboxImpl } from "./leader-inbox.js";
+import { DelegationTracker, TeamWaitTracker, formatTeamWaitWake, pollLeaderInbox as pollLeaderInboxImpl, type TeamWaitWake } from "./leader-inbox.js";
 import {
 	getHookBaseName,
 	areTeamsHooksEnabled,
@@ -36,6 +36,8 @@ import { handleTeamCommand } from "./leader-team-command.js";
 import { registerTeamsTool } from "./leader-teams-tool.js";
 import { getParentSessionId, shouldSilenceInheritedParentAttachClaimWarning } from "./session-parent.js";
 import { branchSelectionNote, ensureSessionFileMaterialized, resolveBranchLeafSelection } from "./session-branching.js";
+import { startWaitPollLoop, type WaitPollLoop } from "./wait-poll-loop.js";
+import { PendingLeaderWakeQueue, type PendingLeaderWake } from "./pending-wake-queue.js";
 import type { ContextMode, SpawnTeammateFn, SpawnTeammateResult, WorkspaceMode } from "./spawn-types.js";
 
 function getTeamsExtensionEntryPath(): string | null {
@@ -150,6 +152,8 @@ export function runLeader(pi: ExtensionAPI): void {
 	let teamConfig: TeamConfig | null = null;
 	const pendingPlanApprovals = new Map<string, { requestId: string; name: string; taskId?: string }>();
 	const delegationTracker = new DelegationTracker();
+	const waitTracker = new TeamWaitTracker();
+	const pendingWaitWakes = new PendingLeaderWakeQueue();
 	// Task list namespace. By default we keep it aligned with the current session id.
 	// (Do NOT read PI_TEAMS_TASK_LIST_ID for the leader; that env var is intended for workers
 	// and can easily be set globally, which makes the leader "lose" its tasks.)
@@ -157,6 +161,7 @@ export function runLeader(pi: ExtensionAPI): void {
 
 	let refreshTimer: NodeJS.Timeout | null = null;
 	let inboxTimer: NodeJS.Timeout | null = null;
+	let waitPollLoop: WaitPollLoop | null = null;
 	let refreshInFlight = false;
 	let inboxInFlight = false;
 	let isStopping = false;
@@ -164,12 +169,16 @@ export function runLeader(pi: ExtensionAPI): void {
 	let style: TeamsStyle = getTeamsStyleFromEnv();
 	let lastAttachClaimHeartbeatMs = 0;
 	let inheritedParentTeamId: string | null = null;
+	let waitWakeScopeEpoch = 0;
+	const memberWaitWakeEpochs = new Map<string, number>();
 
 	const stopLoops = () => {
 		if (refreshTimer) clearInterval(refreshTimer);
 		if (inboxTimer) clearInterval(inboxTimer);
+		waitPollLoop?.stop();
 		refreshTimer = null;
 		inboxTimer = null;
+		waitPollLoop = null;
 	};
 
 	const releaseActiveAttachClaim = async (ctx: ExtensionContext): Promise<void> => {
@@ -199,6 +208,10 @@ export function runLeader(pi: ExtensionAPI): void {
 		currentTeamId = sessionTeamId;
 		taskListId = sessionTeamId;
 		delegationTracker.clear();
+		waitTracker.clear();
+		pendingWaitWakes.clear();
+		memberWaitWakeEpochs.clear();
+		waitWakeScopeEpoch++;
 		if (!shouldSilenceWarning) {
 			ctx.ui.notify(
 				`Attach claim for team ${lostTeamId} is no longer owned by this session; detaching to session team.`,
@@ -210,6 +223,10 @@ export function runLeader(pi: ExtensionAPI): void {
 	};
 
 	const stopAllTeammates = async (ctx: ExtensionContext, reason: string) => {
+		waitTracker.clear();
+		pendingWaitWakes.clear();
+		memberWaitWakeEpochs.clear();
+		waitWakeScopeEpoch++;
 		if (teammates.size === 0) return;
 		isStopping = true;
 		try {
@@ -465,6 +482,87 @@ export function runLeader(pi: ExtensionAPI): void {
 
 	// Auto-done detection: notify once when all tasks complete and teammates idle.
 	let autoDoneNotified = false;
+	let lastWaitDeliveryWarning: { message: string; at: number } | null = null;
+
+	const memberWaitWakeKey = (teamId: string, effectiveTaskListId: string, name: string): string =>
+		`${teamId}:${effectiveTaskListId}:${name}`;
+	const getMemberWaitWakeEpoch = (teamId: string, effectiveTaskListId: string, name: string): number =>
+		memberWaitWakeEpochs.get(memberWaitWakeKey(teamId, effectiveTaskListId, name)) ?? 0;
+	const clearMemberWaitState = (teamId: string, effectiveTaskListId: string, name: string): void => {
+		const key = memberWaitWakeKey(teamId, effectiveTaskListId, name);
+		memberWaitWakeEpochs.set(key, (memberWaitWakeEpochs.get(key) ?? 0) + 1);
+		waitTracker.clearMember(teamId, effectiveTaskListId, name);
+		pendingWaitWakes.clearMember(teamId, effectiveTaskListId, name);
+	};
+	const beginMemberWaitRegistration = (teamId: string, effectiveTaskListId: string, name: string): void => {
+		const key = memberWaitWakeKey(teamId, effectiveTaskListId, name);
+		memberWaitWakeEpochs.set(key, (memberWaitWakeEpochs.get(key) ?? 0) + 1);
+		pendingWaitWakes.clearMember(teamId, effectiveTaskListId, name);
+	};
+
+	const reportWaitDeliveryError = (error: unknown): void => {
+		const message = error instanceof Error ? error.message : String(error);
+		const now = Date.now();
+		if (lastWaitDeliveryWarning?.message === message && now - lastWaitDeliveryWarning.at < 5_000) return;
+		lastWaitDeliveryWarning = { message, at: now };
+		currentCtx?.ui.notify(`Wait wake delivery failed: ${message}`, "warning");
+	};
+
+	const flushPendingWaitWakes = (): void => {
+		if (!currentCtx) return;
+		pendingWaitWakes.flush((wake) => {
+			if (currentCtx?.isIdle()) pi.sendUserMessage(wake.content);
+			else pi.sendUserMessage(wake.content, { deliverAs: "followUp" });
+		}, Date.now(), reportWaitDeliveryError, (wake) =>
+			wake.scopeEpoch === waitWakeScopeEpoch &&
+			wake.teamId === currentTeamId &&
+			wake.taskListId === (taskListId ?? currentTeamId) &&
+			wake.memberEpoch === getMemberWaitWakeEpoch(wake.teamId, wake.taskListId, wake.name),
+		);
+	};
+
+	const enqueuePendingWaitWake = (wake: PendingLeaderWake): void => {
+		if (
+			wake.scopeEpoch !== waitWakeScopeEpoch ||
+			wake.teamId !== currentTeamId ||
+			wake.taskListId !== (taskListId ?? currentTeamId) ||
+			wake.memberEpoch !== getMemberWaitWakeEpoch(wake.teamId, wake.taskListId, wake.name)
+		) return;
+		pendingWaitWakes.enqueue(wake);
+		flushPendingWaitWakes();
+	};
+
+	const wakeLeaderForWait = (wake: TeamWaitWake): void => {
+		if (!currentTeamId) return;
+		const effectiveTaskListId = taskListId ?? currentTeamId;
+		enqueuePendingWaitWake({
+			key: `wait:${currentTeamId}:${effectiveTaskListId}:${wake.name}:${wake.terminalId ?? `${wake.event}:${wake.reason ?? ""}:${wake.stallThresholdMs ?? ""}`}`,
+			teamId: currentTeamId,
+			taskListId: effectiveTaskListId,
+			name: wake.name,
+			scopeEpoch: waitWakeScopeEpoch,
+			memberEpoch: getMemberWaitWakeEpoch(currentTeamId, effectiveTaskListId, wake.name),
+			content: formatTeamWaitWake(style, wake),
+		});
+	};
+
+	const pollWaits = (): void => {
+		if (isStopping || !currentTeamId) return;
+		const effectiveTaskListId = taskListId ?? currentTeamId;
+		for (const wake of waitTracker.pollRpc(currentTeamId, effectiveTaskListId, teammates)) {
+			wakeLeaderForWait(wake);
+		}
+		flushPendingWaitWakes();
+	};
+
+	let lastWaitPollWarning: { message: string; at: number } | null = null;
+	const reportWaitPollError = (error: unknown): void => {
+		const message = error instanceof Error ? error.message : String(error);
+		const now = Date.now();
+		if (lastWaitPollWarning?.message === message && now - lastWaitPollWarning.at < 5_000) return;
+		lastWaitPollWarning = { message, at: now };
+		currentCtx?.ui.notify(`Wait monitor failed: ${message}`, "warning");
+	};
 
 	const refreshTasks = async () => {
 		if (!currentCtx || !currentTeamId) return;
@@ -698,11 +796,17 @@ export function runLeader(pi: ExtensionAPI): void {
 
 	const pollLeaderInbox = async () => {
 		if (!currentCtx || !currentTeamId) return;
-		const teamDir = getTeamDir(currentTeamId);
-		const effectiveTaskListId = taskListId ?? currentTeamId;
+		const pollCtx = currentCtx;
+		const pollTeamId = currentTeamId;
+		const effectiveTaskListId = taskListId ?? pollTeamId;
+		const pollScopeEpoch = waitWakeScopeEpoch;
+		const pollMemberEpochs = new Map(
+			[...teammates.keys()].map((name) => [name, getMemberWaitWakeEpoch(pollTeamId, effectiveTaskListId, name)]),
+		);
+		const teamDir = getTeamDir(pollTeamId);
 		await pollLeaderInboxImpl({
-			ctx: currentCtx,
-			teamId: currentTeamId,
+			ctx: pollCtx,
+			teamId: pollTeamId,
 			teamDir,
 			taskListId: effectiveTaskListId,
 			leadName: teamConfig?.leadName ?? "team-lead",
@@ -714,7 +818,14 @@ export function runLeader(pi: ExtensionAPI): void {
 				pi.sendUserMessage(content, options);
 			},
 			delegationTracker,
+			waitTracker,
+			enqueueWaitWake: (wake) => enqueuePendingWaitWake({
+				...wake,
+				scopeEpoch: pollScopeEpoch,
+				memberEpoch: pollMemberEpochs.get(wake.name) ?? getMemberWaitWakeEpoch(pollTeamId, effectiveTaskListId, wake.name),
+			}),
 		});
+		flushPendingWaitWakes();
 	};
 
 	pi.on("tool_call", (event, _ctx) => {
@@ -736,6 +847,10 @@ export function runLeader(pi: ExtensionAPI): void {
 		// Clear any /team done suppression from a previous session.
 		widgetSuppressed = false;
 		autoDoneNotified = false;
+		waitTracker.clear();
+		pendingWaitWakes.clear();
+		memberWaitWakeEpochs.clear();
+		waitWakeScopeEpoch++;
 
 		// Claude-style: a persisted team config file.
 		await ensureTeamConfig(getTeamDir(currentTeamId), {
@@ -773,6 +888,13 @@ export function runLeader(pi: ExtensionAPI): void {
 		// Don't keep non-interactive/child pi processes alive just because leader polling exists.
 		refreshTimer.unref?.();
 
+		// Wait liveness is deliberately independent of heartbeat/refresh I/O. A
+		// blocked attach-claim lock or task-store read must not strand a wait.
+		waitPollLoop = startWaitPollLoop({
+			poll: pollWaits,
+			onError: reportWaitPollError,
+		});
+
 		inboxTimer = setInterval(async () => {
 			if (isStopping) return;
 			if (inboxInFlight) return;
@@ -789,8 +911,12 @@ export function runLeader(pi: ExtensionAPI): void {
 
 	pi.on("session_shutdown", async () => {
 		if (!currentCtx) return;
-		await releaseActiveAttachClaim(currentCtx);
 		stopLoops();
+		waitTracker.clear();
+		pendingWaitWakes.clear();
+		memberWaitWakeEpochs.clear();
+		waitWakeScopeEpoch++;
+		await releaseActiveAttachClaim(currentCtx);
 		const hadTeammates = teammates.size > 0;
 		const strings = getTeamsStrings(style);
 		await stopAllTeammates(currentCtx, `The ${strings.teamNoun} is over`);
@@ -849,6 +975,9 @@ export function runLeader(pi: ExtensionAPI): void {
 		},
 		pendingPlanApprovals,
 		delegationTracker,
+		waitTracker,
+		beginWaitRegistration: beginMemberWaitRegistration,
+		clearWaitStateForMember: clearMemberWaitState,
 	});
 
 	const openWidget = async (ctx: ExtensionCommandContext) => {
@@ -888,6 +1017,7 @@ export function runLeader(pi: ExtensionAPI): void {
 				const rpc = teammates.get(name);
 				if (!rpc) return;
 
+				clearMemberWaitState(teamId, effectiveTlId, name);
 				void rpc.stop();
 				teammates.delete(name);
 
@@ -1017,12 +1147,20 @@ export function runLeader(pi: ExtensionAPI): void {
 				setTaskListId: (id) => {
 					taskListId = id;
 					delegationTracker.clear();
+					waitTracker.clear();
+					pendingWaitWakes.clear();
+					memberWaitWakeEpochs.clear();
+					waitWakeScopeEpoch++;
 				},
 				getActiveTeamId: () => currentTeamId ?? ctx.sessionManager.getSessionId(),
 				setActiveTeamId: (teamId) => {
 					currentTeamId = teamId;
 					inheritedParentTeamId = null;
 					delegationTracker.clear();
+					waitTracker.clear();
+					pendingWaitWakes.clear();
+					memberWaitWakeEpochs.clear();
+					waitWakeScopeEpoch++;
 				},
 				pendingPlanApprovals,
 				getDelegateMode: () => delegateMode,
@@ -1039,6 +1177,12 @@ export function runLeader(pi: ExtensionAPI): void {
 				shellQuote,
 				getCurrentCtx: () => currentCtx,
 				stopAllTeammates,
+				clearWaits: () => {
+					waitTracker.clear();
+					pendingWaitWakes.clear();
+					memberWaitWakeEpochs.clear();
+					waitWakeScopeEpoch++;
+				},
 			});
 		},
 	});

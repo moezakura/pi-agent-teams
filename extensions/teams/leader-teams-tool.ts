@@ -38,12 +38,26 @@ import {
 	formatElapsed,
 	lastMessageSummary,
 	formatTokens,
+	getStallThresholdMs,
 	toolActivity,
 } from "./teams-ui-shared.js";
 import type { ContextMode, WorkspaceMode, SpawnTeammateFn } from "./spawn-types.js";
-import type { DelegationTracker } from "./leader-inbox.js";
+import type { DelegationTracker, TeamWaitTracker } from "./leader-inbox.js";
 
 type TeamsToolDelegateTask = { text: string; assignee?: string };
+
+const MAX_WAIT_STALL_THRESHOLD_MS = 30 * 60 * 1000;
+
+/**
+ * The wait action treats its environment threshold as configuration input, not
+ * a JavaScript number literal. Keep its grammar deliberately narrow so values
+ * such as `2e6` and `1800000.5` cannot be truncated by parseInt.
+ */
+function parseStrictPositiveDecimalInteger(raw: string): number | null {
+	if (!/^[0-9]+$/.test(raw)) return null;
+	const value = Number(raw);
+	return Number.isSafeInteger(value) && value > 0 ? value : null;
+}
 
 function describeModelSource(source: TeammateModelSource): string {
 	if (source === "override") return "override";
@@ -75,6 +89,7 @@ const TeamsActionSchema = stringEnum(
 		"member_shutdown",
 		"member_kill",
 		"member_prune",
+		"wait",
 		"team_done",
 		"plan_approve",
 		"plan_reject",
@@ -129,6 +144,13 @@ const TeamsToolParamsSchema = Type.Object({
 	assignee: Type.Optional(Type.String({ description: "Assignee name for action=task_assign." })),
 	status: Type.Optional(TeamsTaskStatusSchema),
 	name: Type.Optional(Type.String({ description: "Teammate name for member/message actions." })),
+	stallThresholdMs: Type.Optional(
+		Type.Integer({
+			minimum: 1,
+			maximum: MAX_WAIT_STALL_THRESHOLD_MS,
+			description: "For action=wait: no-agent-event threshold before waking as stalled (default: PI_TEAMS_STALL_THRESHOLD_MS or 300000 / 5 minutes; maximum: 1800000 / 30 minutes).",
+		}),
+	),
 	message: Type.Optional(Type.String({ description: "Message body for messaging actions." })),
 	reason: Type.Optional(Type.String({ description: "Optional reason for lifecycle actions." })),
 	feedback: Type.Optional(Type.String({ description: "Feedback for action=plan_reject." })),
@@ -181,8 +203,12 @@ export function registerTeamsTool(opts: {
 	stopAllTeammates: (reason: string) => Promise<void>;
 	pendingPlanApprovals: Map<string, { requestId: string; name: string; taskId?: string }>;
 	delegationTracker?: DelegationTracker;
+	waitTracker?: TeamWaitTracker;
+	/** Invalidate retryable terminal wakes from an earlier registration for this member. */
+	beginWaitRegistration?: (teamId: string, taskListId: string, name: string) => void;
+	clearWaitStateForMember?: (teamId: string, taskListId: string, name: string) => void;
 }): void {
-	const { pi, teammates, spawnTeammate, getTeamId, getTaskListId, getTracker, getTeamConfig: getTeamCfg, refreshTasks, renderWidget, hideWidget, stopAllTeammates, pendingPlanApprovals, delegationTracker } = opts;
+	const { pi, teammates, spawnTeammate, getTeamId, getTaskListId, getTracker, getTeamConfig: getTeamCfg, refreshTasks, renderWidget, hideWidget, stopAllTeammates, pendingPlanApprovals, delegationTracker, waitTracker, beginWaitRegistration, clearWaitStateForMember } = opts;
 
 	pi.registerTool({
 		name: "teams",
@@ -191,6 +217,7 @@ export function registerTeamsTool(opts: {
 			"Spawn comrade agents and delegate tasks. Each comrade is a child Pi process that executes work autonomously and reports back.",
 			"You can also mutate existing tasks (assign, unassign, set status, dependencies), send team messages, run teammate lifecycle actions, and manage hooks/model policy without user slash commands.",
 			"Use member_status (with optional name) to get real-time worker state: activity, time in state, stall detection, tool use, tokens, and last message summary.",
+			"Use wait with a live RPC comrade name to register a non-blocking watch; the leader is awakened on idle/failure/close/stall while active work continues to be monitored.",
 			"Use team_done to end a team run when all tasks are complete (stops teammates, hides widget).",
 			"Provide a list of tasks with optional assignees; comrades are spawned automatically and assigned round-robin if unspecified.",
 			"Options: contextMode=branch (clone session context), workspaceMode=worktree (git worktree isolation).",
@@ -684,6 +711,119 @@ export function registerTeamsTool(opts: {
 				};
 			}
 
+			if (action === "wait") {
+				const nameRaw = params.name?.trim();
+				const name = sanitizeName(nameRaw ?? "");
+				if (!name) {
+					return {
+						content: [{ type: "text", text: "wait requires name" }],
+						details: { action, name: nameRaw },
+					};
+				}
+				let stallThresholdSource: "params.stallThresholdMs" | "PI_TEAMS_STALL_THRESHOLD_MS" | "default";
+				let stallThresholdMs: number;
+				if (params.stallThresholdMs !== undefined) {
+					stallThresholdSource = "params.stallThresholdMs";
+					stallThresholdMs = params.stallThresholdMs;
+				} else {
+					const envStallThreshold = process.env.PI_TEAMS_STALL_THRESHOLD_MS;
+					if (envStallThreshold !== undefined) {
+						stallThresholdSource = "PI_TEAMS_STALL_THRESHOLD_MS";
+						const parsed = parseStrictPositiveDecimalInteger(envStallThreshold);
+						if (parsed === null) {
+							return {
+								content: [{
+									type: "text",
+									text: "wait rejected: PI_TEAMS_STALL_THRESHOLD_MS must be a positive decimal integer string.",
+								}],
+								details: {
+									action,
+									teamId,
+									name,
+									status: "rejected",
+									reason: "invalid_environment_stall_threshold",
+									stallThresholdSource,
+									environmentValue: envStallThreshold,
+								},
+							};
+						}
+						stallThresholdMs = parsed;
+					} else {
+						stallThresholdSource = "default";
+						stallThresholdMs = getStallThresholdMs();
+					}
+				}
+				if (stallThresholdMs > MAX_WAIT_STALL_THRESHOLD_MS) {
+					return {
+						content: [{
+							type: "text",
+							text: `wait rejected: stallThresholdMs must be at most ${MAX_WAIT_STALL_THRESHOLD_MS}ms (30 minutes); received ${stallThresholdMs}ms from ${stallThresholdSource}.`,
+						}],
+						details: {
+							action,
+							teamId,
+							name,
+							status: "rejected",
+							reason: "stall_threshold_exceeds_maximum",
+							stallThresholdMs,
+							maximumStallThresholdMs: MAX_WAIT_STALL_THRESHOLD_MS,
+							stallThresholdSource,
+						},
+					};
+				}
+
+				const rpc = teammates.get(name);
+				if (!rpc) {
+					return {
+						content: [{ type: "text", text: `wait is unsupported for manual/non-RPC ${strings.memberTitle.toLowerCase()}s: ${name}` }],
+						details: { action, teamId, name, status: "unsupported", reason: "manual_or_non_rpc_worker" },
+					};
+				}
+				if (!waitTracker) {
+					return {
+						content: [{ type: "text", text: "wait is unavailable because leader monitoring is not initialized" }],
+						details: { action, teamId, name, status: "unavailable" },
+					};
+				}
+
+				if (rpc.status === "stopped" || rpc.status === "error") {
+					return {
+						content: [{ type: "text", text: `${formatMemberDisplayName(style, name)} is already ${rpc.status}; no wait was registered.` }],
+						details: { action, teamId, taskListId: effectiveTlId, name, status: rpc.status, nonBlocking: true, alreadyTerminal: true },
+					};
+				}
+				const registeredAt = Date.now();
+				const armedForNextRun = rpc.status === "idle";
+				beginWaitRegistration?.(teamId, effectiveTlId, name);
+				const registration = waitTracker.register({
+					teamId,
+					taskListId: effectiveTlId,
+					name,
+					stallThresholdMs,
+					registeredAt,
+					armedForNextRun,
+					rpcStatusChangeAtRegistration: rpc.lastStatusChangeAt,
+					...(armedForNextRun ? {} : { rpcRunStartedAt: rpc.lastStatusChangeAt }),
+				});
+				return {
+					content: [{
+						type: "text",
+						text: `${registration.replaced ? "Updated" : "Registered"} non-blocking wait for ${formatMemberDisplayName(style, name)}. ${armedForNextRun ? "It is idle, so the wait is armed for its next run. " : ""}The leader will wake when the watched run becomes idle, fails, closes, or does not start/progress for ${Math.round(stallThresholdMs / 1000)}s.`,
+					}],
+					details: {
+						action,
+						teamId,
+						taskListId: effectiveTlId,
+						name,
+						status: "watching",
+						armedForNextRun,
+						nonBlocking: true,
+						stallThresholdMs,
+						replaced: registration.replaced,
+					},
+				};
+			}
+
 			if (action === "member_kill") {
 				const nameRaw = params.name?.trim();
 				const name = sanitizeName(nameRaw ?? "");
@@ -701,6 +841,8 @@ export function registerTeamsTool(opts: {
 					};
 				}
 
+				if (clearWaitStateForMember) clearWaitStateForMember(teamId, effectiveTlId, name);
+				else waitTracker?.clearMember(teamId, effectiveTlId, name);
 				await rpc.stop();
 				teammates.delete(name);
 				await unassignTasksForAgent(teamDir, effectiveTlId, name, `${formatMemberDisplayName(style, name)} ${strings.killedVerb}`);
@@ -841,6 +983,7 @@ export function registerTeamsTool(opts: {
 
 				// Stop all RPC teammates (reuses leader's stopAllTeammates for proper
 				// event unsub + tracker/transcript cleanup — avoids stale state on reuse).
+				waitTracker?.clear();
 				await stopAllTeammates("team done");
 
 				// Mark config workers offline + send shutdown mailbox messages

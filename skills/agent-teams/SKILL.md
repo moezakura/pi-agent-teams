@@ -43,6 +43,7 @@ Use the **`teams` tool** (LLM-callable) for delegation, task/messaging mutations
 | `message_broadcast` | `message` | Mailbox broadcast. `urgent=true` interrupts active turns. |
 | `message_steer` | `name`, `message` | RPC steer for running teammate. |
 | `member_spawn` | `name` | Supports context/workspace/model/thinking/plan options. |
+| `wait` | `name` | Non-blocking watch. If already idle, arms for the next run; `stallThresholdMs` defaults to five minutes. |
 | `member_shutdown` | `name` or `all=true` | Graceful mailbox shutdown request. |
 | `member_kill` | `name` | Force-stop RPC teammate. |
 | `member_prune` | _(none)_ | Mark stale workers offline (`all=true` to force). |
@@ -61,6 +62,7 @@ teams({ action: "task_assign", taskId: "12", assignee: "alice" })
 teams({ action: "task_dep_add", taskId: "12", depId: "7" })
 teams({ action: "message_broadcast", message: "Sync: finishing this milestone" })
 teams({ action: "message_dm", name: "alice", message: "Stop using lib X, use Y instead", urgent: true })
+teams({ action: "wait", name: "alice" })
 teams({ action: "member_kill", name: "alice" })
 teams({ action: "plan_reject", name: "alice", feedback: "Include rollback strategy" })
 teams({ action: "hooks_policy_get" })
@@ -71,6 +73,8 @@ teams({ action: "team_done" })
 ```
 
 This covers most day-to-day orchestration without slash commands. For nuanced/manual control, use `/team ...` commands directly.
+
+`wait` may be registered while an RPC teammate is idle and then followed by a DM. In that case it watches the next run and wakes the leader once on idle, failure, close, or stall. If the next run never starts, the registration emits one stalled notification after `stallThresholdMs` (five minutes by default). Do not treat the teammate's pre-registration idle notification as completion of the new watch.
 
 For more control, use `/team spawn`:
 

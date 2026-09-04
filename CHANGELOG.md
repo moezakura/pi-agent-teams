@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Features
+
+- **Non-blocking teammate wait** — added the `teams` tool `wait` action. It immediately registers a watch for an RPC teammate, then asynchronously notifies the leader when that teammate becomes idle, fails, closes, or exceeds the rolling inactivity threshold (five minutes by default; configurable per watch with `stallThresholdMs`). Registering against an idle RPC teammate now arms the watch for its next run, allowing a register-then-DM workflow; if no run starts, the armed watch reports stalled once at the threshold. Pre-registration idle messages are excluded, while RPC status epochs and inbox timestamps cover runs that start and finish between polls. A stable RPC-idle fallback resolves active-run watches whose idle mailbox notification is unavailable while ignoring brief auto-claim idle gaps. Its independent monitoring loop continues polling even if attach-claim heartbeat or task refresh I/O is delayed or fails. If leader-message injection throws, the terminal wake stays in a deduplicated in-memory retry queue until delivery succeeds or the relevant team/session is cleaned up; stale wakes from an earlier leader scope are discarded, while a later wait registration receives its own delivery identity. Thresholds are limited to 30 minutes (1–1,800,000 ms); oversized action or environment values are rejected rather than clamped. `PI_TEAMS_STALL_THRESHOLD_MS` must be a positive decimal-integer string, so fractional or exponent notation is rejected instead of coerced.
+
 ## [0.5.6] - 2026-06-13
 
 ### Fixes

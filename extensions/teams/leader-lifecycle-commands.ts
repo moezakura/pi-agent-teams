@@ -154,12 +154,13 @@ export async function handleTeamCleanupCommand(opts: {
 	rest: string[];
 	teamId: string;
 	teammates: Map<string, TeammateRpc>;
+	clearWaits: () => void;
 	refreshTasks: () => Promise<void>;
 	getTasks: () => TeamTask[];
 	renderWidget: () => void;
 	style: TeamsStyle;
 }): Promise<void> {
-	const { ctx, rest, teamId, teammates, refreshTasks, getTasks, renderWidget, style } = opts;
+	const { ctx, rest, teamId, teammates, clearWaits, refreshTasks, getTasks, renderWidget, style } = opts;
 	const strings = getTeamsStrings(style);
 
 	const flags = rest.filter((a) => a.startsWith("--"));
@@ -220,6 +221,10 @@ export async function handleTeamCleanupCommand(opts: {
 	}
 
 	try {
+		// Cleanup removes the team artifacts that mailbox-based watches depend on.
+		// Do this only after all refusal/confirmation checks have passed, so a
+		// rejected cleanup leaves active waits intact.
+		clearWaits();
 		const result = await cleanupTeamDir(teamsRoot, teamDir, { teamId, repoCwd: ctx.cwd });
 		const parts: string[] = [`Cleaned up team directory: ${teamDir}`];
 		if (result.worktreeResult.removedWorktrees.length > 0) {

@@ -20,6 +20,7 @@ Additional Pi-specific capabilities:
 - **Git worktrees** — optionally give each teammate its own worktree so they work on isolated branches without conflicting edits.
 - **Session branching** — clone the leader's conversation context into a teammate so it starts with full awareness of the work so far, instead of from scratch.
 - **Completion notifications** — when a teammate finishes or fails a task, the leader LLM receives a structured `[Team]` message with task ID, subject, result summary, and progress counters so it can orchestrate autonomously without human intervention. When quality-gate hooks are active, the message warns that task states may still change.
+- **Non-blocking teammate waits** — the leader can register a watch for a teammate and continue working immediately. The leader LLM is notified when the RPC teammate becomes idle, fails, closes, or stalls.
 - **Hooks / quality gates** — optional leader-side hooks on idle / task completion to run scripts (opt-in).
 
 ## UI style (terminology + naming)
@@ -153,6 +154,7 @@ Or let the model drive it with the delegate tool:
 | `message_steer` | `name`, `message` | Send steer instruction to a running RPC teammate. |
 | `member_spawn` | `name` | Spawn one teammate (supports context/workspace/model/thinking/plan options). |
 | `member_status` | optional `name` | Real-time worker status: activity, time in state, stall detection, tool use, tokens, last message. Omit name for all-worker summary. |
+| `wait` | `name` | Register a non-blocking watch for an RPC teammate. Returns immediately; the leader receives a later `[Team]` notification on idle, failure, close, or stall. Optional `stallThresholdMs` overrides the five-minute inactivity window; values must be 1–1,800,000 ms (30 minutes). |
 | `member_shutdown` | `name` or `all=true` | Request graceful shutdown via mailbox handshake. |
 | `member_kill` | `name` | Force-stop one RPC teammate and unassign active tasks. |
 | `member_prune` | _(none)_ | Mark stale non-RPC workers offline (`all=true` to force). |
@@ -171,6 +173,8 @@ Example calls:
 { "action": "task_dep_add", "taskId": "12", "depId": "7" }
 { "action": "message_broadcast", "message": "Sync: finishing this milestone" }
 { "action": "message_dm", "name": "alice", "message": "Stop using lib X, use Y instead", "urgent": true }
+{ "action": "wait", "name": "alice" }
+{ "action": "wait", "name": "alice", "stallThresholdMs": 600000 }
 { "action": "member_kill", "name": "alice" }
 { "action": "plan_approve", "name": "alice" }
 { "action": "hooks_policy_get" }
@@ -250,6 +254,16 @@ The widget and panel show real-time worker state at a glance:
 - **Current activity**: tool verb (e.g. `running…`, `editing…`) displayed inline
 
 The `member_status` tool action provides the same information programmatically for agent-driven orchestration — no need to parse JSONL files or check file modification times.
+
+### Non-blocking teammate wait
+
+Use the `wait` action when the leader should continue coordinating while an RPC teammate reaches a meaningful state:
+
+```json
+{ "action": "wait", "name": "alice" }
+```
+
+The call only registers the watch and returns immediately. If the RPC teammate is already idle, the watch is armed for its **next run**; this supports registering first and then waking it with a DM. A later structured `[Team]` message is delivered when that run becomes idle, fails, closes, or stalls. If the armed worker never starts, registration itself reaches the same threshold and emits one stalled notification instead of waiting forever. It watches the agent rather than an individual task, so a worker that auto-claims and starts another task remains watched. Pre-registration idle notifications are ignored. Inbox timestamps and RPC status epochs also detect a short run that starts and finishes between polling ticks. For active runs, inbox idle notifications are preferred; if one is unavailable, a short stable RPC idle grace period resolves the watch. A brief idle-to-streaming transition does not resolve an active-run watch. Monitoring runs in its own lightweight loop, so a delayed or failed attach-claim heartbeat or task refresh cannot strand an active wait. If Pi temporarily rejects a leader-message injection, the terminal wake is queued and retried with deduplication; it is discarded on team or session cleanup, or when it belongs to an earlier team/task scope. Stall detection uses a rolling five-minute inactivity window by default; pass `stallThresholdMs` from 1 to 1,800,000 ms (30 minutes) to override it for this watch. The same upper bound applies when `PI_TEAMS_STALL_THRESHOLD_MS` supplies the default; it must be a positive decimal-integer string (for example, `600000`), so values such as `1800000.5` and `2e6` are rejected rather than coerced or clamped. This is a monitor, not a join: it never blocks the leader tool call.
 
 ### Panel shortcuts (`/tw` / `/team panel`)
 
