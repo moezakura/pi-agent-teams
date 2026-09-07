@@ -138,6 +138,10 @@ Or let the model drive it with the delegate tool:
 }
 ```
 
+Delegation resolves each task owner before starting workers. Named assignees do not create an additional automatic worker pool; tasks without an assignee use the explicit `teammates` pool, existing teammates, or an automatically generated pool. `maxTeammates` limits only that automatic pool. An explicit `teammates` list still requests those workers even when all tasks have named assignees.
+
+When starting a managed teammate again, Teams marks previously stored unread shutdown requests for that name as read before the new worker starts. Other mailbox content is retained. A same-name member recorded as online but not owned by this leader blocks spawning; resolve its status through the existing lifecycle/prune actions before retrying. Invalid configuration or mailbox data also blocks spawning rather than discarding messages. This boundary does not identify an old sender's shutdown request that arrives after cleanup.
+
 ### Teams tool action reference (agent-run)
 
 | Action | Required fields | Purpose |

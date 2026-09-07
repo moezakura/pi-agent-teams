@@ -30,7 +30,7 @@
     "lint": "eslint 'extensions/**/*.ts' 'scripts/**/*.ts' 'scripts/**/*.mts'",
     "typecheck": "tsc -p tsconfig.strict.json",
     "check": "npm run typecheck && npm run lint",
-    "smoke-test": "tsx scripts/smoke-test.mts",
+    "smoke-test": "tsx scripts/smoke-test.mts && tsx scripts/delegate-lifecycle-test.mts && tsx scripts/cli-lifecycle-test.mts && tsx scripts/spawn-mailbox-test.mts",
     "integration-claim-test": "tsx scripts/integration-claim-test.mts",
     "integration-spawn-overrides-test": "tsx scripts/integration-spawn-overrides-test.mts",
     "integration-hooks-remediation-test": "tsx scripts/integration-hooks-remediation-test.mts",

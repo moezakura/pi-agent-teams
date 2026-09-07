@@ -3,7 +3,8 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
-import { writeToMailbox } from "./mailbox.js";
+import { retireShutdownRequests, writeToMailbox } from "./mailbox.js";
+import { assertSpawnConfigReadable } from "./spawn-preflight.js";
 import { sanitizeName } from "./names.js";
 import { TEAM_MAILBOX_NS, taskAssignmentPayload } from "./protocol.js";
 import { createTask, listTasks, unassignTasksForAgent, updateTask, type TeamTask } from "./task-store.js";
@@ -143,6 +144,7 @@ async function teamDirHasAnyTasks(teamDir: string): Promise<boolean> {
 // Message parsers are shared with the worker implementation.
 export function runLeader(pi: ExtensionAPI): void {
 	const teammates = new Map<string, TeammateRpc>();
+	const spawningNames = new Set<string>();
 	const tracker = new ActivityTracker();
 	const transcriptTracker = new TranscriptTracker();
 	const teammateEventUnsubs = new Map<string, () => void>();
@@ -618,7 +620,7 @@ export function runLeader(pi: ExtensionAPI): void {
 
 		const name = sanitizeName(opts.name);
 		if (!name) return { ok: false, error: "Missing comrade name" };
-		if (teammates.has(name)) {
+		if (teammates.has(name) || spawningNames.has(name)) {
 			const strings = getTeamsStrings(style);
 			return { ok: false, error: `${formatMemberDisplayName(style, name)} already exists (${strings.teamNoun})` };
 		}
@@ -638,90 +640,103 @@ export function runLeader(pi: ExtensionAPI): void {
 		const teamId = currentTeamId ?? ctx.sessionManager.getSessionId();
 		const teamDir = getTeamDir(teamId);
 		const teamSessionsDir = getTeamSessionsDir(teamDir);
-		const session = await createSessionForTeammate(ctx, mode, teamSessionsDir);
-		const { sessionFile, note } = session;
-		warnings.push(...session.warnings);
-
-		const t = new TeammateRpc(name, sessionFile);
-		teammates.set(name, t);
-		// Restore the widget if it was hidden by /team done — new work is starting.
-		restoreWidget();
-		// Track teammate activity for the widget/panel.
-		// Render on status-changing events for a more "live" feel.
-		const unsub = t.onEvent((ev) => {
-			tracker.handleEvent(name, ev);
-			transcriptTracker.handleEvent(name, ev);
-			// Refresh widget on events that change visible state (tool start/end, turn end).
-			if (
-				ev.type === "tool_execution_start" ||
-				ev.type === "tool_execution_end" ||
-				ev.type === "agent_end"
-			) {
-				renderWidget();
-			}
-		});
-		teammateEventUnsubs.set(name, unsub);
-		renderWidget();
-
-		// On crash/close, unassign tasks like Claude.
-		const leaderTeamId = teamId;
-		t.onClose((code) => {
-			try {
-				teammateEventUnsubs.get(name)?.();
-			} catch {
-				// ignore
-			}
-			teammateEventUnsubs.delete(name);
-			tracker.reset(name);
-			transcriptTracker.reset(name);
-
-			if (currentTeamId !== leaderTeamId) return;
-			const effectiveTlId = taskListId ?? leaderTeamId;
-			void unassignTasksForAgent(
-				teamDir,
-				effectiveTlId,
-				name,
-				`${formatMemberDisplayName(style, name)} ${getTeamsStrings(style).leftVerb}`,
-			).finally(() => {
-				void refreshTasks().finally(renderWidget);
-			});
-			void setMemberStatus(teamDir, name, "offline", { meta: { exitCode: code ?? undefined } });
-		});
-
-		const builtInToolSet = new Set(["read", "bash", "edit", "write", "grep", "find", "ls"]);
-		const tools = (pi.getActiveTools() ?? []).filter((t) => builtInToolSet.has(t));
-		const argsForChild: string[] = [];
-		if (sessionFile) argsForChild.push("--session", sessionFile);
-		argsForChild.push("--session-dir", teamSessionsDir);
-		if (tools.length) argsForChild.push("--tools", tools.join(","));
-
-		// Model + thinking for the child process.
-		if (childModelId) {
-			if (childProvider) argsForChild.push("--provider", childProvider);
-			argsForChild.push("--model", childModelId);
-		}
-		argsForChild.push("--thinking", thinkingLevel);
-
-		const teamsEntry = getTeamsExtensionEntryPath();
-		if (teamsEntry) {
-			argsForChild.push("--no-extensions", "-e", teamsEntry);
-		}
-
-		const strings = getTeamsStrings(style);
-		const systemAppend = `You are ${strings.memberTitle.toLowerCase()} '${name}'. You collaborate with the ${strings.leaderTitle.toLowerCase()}. Prefer working from the shared task list.\n`;
-		argsForChild.push("--append-system-prompt", systemAppend);
-
-		const autoClaim = (process.env.PI_TEAMS_DEFAULT_AUTO_CLAIM ?? "1") === "1";
-
-		let childCwd = ctx.cwd;
-		if (workspaceMode === "worktree") {
-			const res = await ensureWorktreeCwd({ leaderCwd: ctx.cwd, teamDir, teamId, agentName: name });
-			childCwd = res.cwd;
-			workspaceMode = res.mode;
-			warnings.push(...res.warnings);
-		}
-
+		// Reserve synchronously before session/config I/O so concurrent spawns cannot
+		// both pass the name check while preparing the same mailbox.
+		spawningNames.add(name);
+		let unsubscribeClose: (() => void) | undefined;
+		let started = false;
 		try {
+			const config = await assertSpawnConfigReadable(teamDir);
+			if (config?.members.some((member) => sanitizeName(member.name) === name && member.status === "online")) {
+				throw new Error(`Cannot spawn ${name}: an online member with this name is not owned by this leader`);
+			}
+			const session = await createSessionForTeammate(ctx, mode, teamSessionsDir);
+			const { sessionFile, note } = session;
+			warnings.push(...session.warnings);
+
+			const t = new TeammateRpc(name, sessionFile);
+			teammates.set(name, t);
+			// Restore the widget if it was hidden by /team done — new work is starting.
+			restoreWidget();
+			// Track teammate activity for the widget/panel.
+			// Render on status-changing events for a more "live" feel.
+			const unsub = t.onEvent((ev) => {
+				tracker.handleEvent(name, ev);
+				transcriptTracker.handleEvent(name, ev);
+				// Refresh widget on events that change visible state (tool start/end, turn end).
+				if (
+					ev.type === "tool_execution_start" ||
+					ev.type === "tool_execution_end" ||
+					ev.type === "agent_end"
+				) {
+					renderWidget();
+				}
+			});
+			teammateEventUnsubs.set(name, unsub);
+			renderWidget();
+
+			// On crash/close, unassign tasks like Claude.
+			const leaderTeamId = teamId;
+			unsubscribeClose = t.onClose((code) => {
+				try {
+					teammateEventUnsubs.get(name)?.();
+				} catch {
+					// ignore
+				}
+				teammateEventUnsubs.delete(name);
+				tracker.reset(name);
+				transcriptTracker.reset(name);
+
+				if (currentTeamId !== leaderTeamId) return;
+				const effectiveTlId = taskListId ?? leaderTeamId;
+				void unassignTasksForAgent(
+					teamDir,
+					effectiveTlId,
+					name,
+					`${formatMemberDisplayName(style, name)} ${getTeamsStrings(style).leftVerb}`,
+				).finally(() => {
+					void refreshTasks().finally(renderWidget);
+				});
+				void setMemberStatus(teamDir, name, "offline", { meta: { exitCode: code ?? undefined } });
+			});
+
+			const builtInToolSet = new Set(["read", "bash", "edit", "write", "grep", "find", "ls"]);
+			const tools = (pi.getActiveTools() ?? []).filter((t) => builtInToolSet.has(t));
+			const argsForChild: string[] = [];
+			if (sessionFile) argsForChild.push("--session", sessionFile);
+			argsForChild.push("--session-dir", teamSessionsDir);
+			if (tools.length) argsForChild.push("--tools", tools.join(","));
+
+			// Model + thinking for the child process.
+			if (childModelId) {
+				if (childProvider) argsForChild.push("--provider", childProvider);
+				argsForChild.push("--model", childModelId);
+			}
+			argsForChild.push("--thinking", thinkingLevel);
+
+			const teamsEntry = getTeamsExtensionEntryPath();
+			if (teamsEntry) {
+				argsForChild.push("--no-extensions", "-e", teamsEntry);
+			}
+
+			const strings = getTeamsStrings(style);
+			const systemAppend = `You are ${strings.memberTitle.toLowerCase()} '${name}'. You collaborate with the ${strings.leaderTitle.toLowerCase()}. Prefer working from the shared task list.\n`;
+			argsForChild.push("--append-system-prompt", systemAppend);
+
+			const autoClaim = (process.env.PI_TEAMS_DEFAULT_AUTO_CLAIM ?? "1") === "1";
+
+			let childCwd = ctx.cwd;
+			if (workspaceMode === "worktree") {
+				const res = await ensureWorktreeCwd({ leaderCwd: ctx.cwd, teamDir, teamId, agentName: name });
+				childCwd = res.cwd;
+				workspaceMode = res.mode;
+				warnings.push(...res.warnings);
+			}
+
+			// Session/workspace validation is complete; no worker can poll until start.
+			for (const namespace of new Set([TEAM_MAILBOX_NS, sanitizeName(taskListId ?? teamId)])) {
+				await retireShutdownRequests(teamDir, namespace, name);
+			}
 			await t.start({
 				cwd: childCwd,
 				env: {
@@ -736,62 +751,73 @@ export function runLeader(pi: ExtensionAPI): void {
 				},
 				args: argsForChild,
 			});
-		} catch (err) {
-			teammates.delete(name);
-			return { ok: false, error: err instanceof Error ? err.message : String(err) };
-		}
+			started = true;
 
-		const sessionName = `pi agent teams - ${strings.memberTitle.toLowerCase()} ${name}`;
+			const sessionName = `pi agent teams - ${strings.memberTitle.toLowerCase()} ${name}`;
 
-		// Leader-driven session naming (so teammates are easy to spot in /resume).
-		try {
-			await t.setSessionName(sessionName);
-		} catch (err) {
-			warnings.push(`Failed to set session name for ${name}: ${err instanceof Error ? err.message : String(err)}`);
-		}
+			// Leader-driven session naming (so teammates are easy to spot in /resume).
+			try {
+				await t.setSessionName(sessionName);
+			} catch (err) {
+				warnings.push(`Failed to set session name for ${name}: ${err instanceof Error ? err.message : String(err)}`);
+			}
 
-		// Also send via mailbox so non-RPC/manual workers can be named the same way.
-		try {
-			const ts = new Date().toISOString();
-			await writeToMailbox(teamDir, TEAM_MAILBOX_NS, name, {
-				from: "team-lead",
-				text: JSON.stringify({ type: "set_session_name", name: sessionName, from: "team-lead", timestamp: ts }),
-				timestamp: ts,
+			// Also send via mailbox so non-RPC/manual workers can be named the same way.
+			try {
+				const ts = new Date().toISOString();
+				await writeToMailbox(teamDir, TEAM_MAILBOX_NS, name, {
+					from: "team-lead",
+					text: JSON.stringify({ type: "set_session_name", name: sessionName, from: "team-lead", timestamp: ts }),
+					timestamp: ts,
+				});
+			} catch {
+				// ignore
+			}
+
+			await ensureTeamConfig(teamDir, { teamId, taskListId: taskListId ?? teamId, leadName: "team-lead", style });
+			const childModel = formatProviderModel(childProvider, childModelId);
+			await upsertMember(teamDir, {
+				name,
+				role: "worker",
+				status: "online",
+				cwd: childCwd,
+				sessionFile,
+				meta: {
+					workspaceMode,
+					sessionName,
+					thinkingLevel,
+					...(childModel ? { model: childModel } : {}),
+				},
 			});
-		} catch {
-			// ignore
-		}
 
-		await ensureTeamConfig(teamDir, { teamId, taskListId: taskListId ?? teamId, leadName: "team-lead", style });
-		const childModel = formatProviderModel(childProvider, childModelId);
-		await upsertMember(teamDir, {
-			name,
-			role: "worker",
-			status: "online",
-			cwd: childCwd,
-			sessionFile,
-			meta: {
+			await refreshTasks();
+			renderWidget();
+
+			return {
+				ok: true,
+				name,
+				mode,
 				workspaceMode,
-				sessionName,
-				thinkingLevel,
-				...(childModel ? { model: childModel } : {}),
-			},
-		});
-
-		await refreshTasks();
-		renderWidget();
-
-		return {
-			ok: true,
-			name,
-			mode,
-			workspaceMode,
-			childCwd,
-			note,
-			model: childModel ?? undefined,
-			thinking: thinkingLevel,
-			warnings,
-		};
+				childCwd,
+				note,
+				model: childModel ?? undefined,
+				thinking: thinkingLevel,
+				warnings,
+			};
+		} catch (err) {
+			if (!started) {
+				teammateEventUnsubs.get(name)?.();
+				teammateEventUnsubs.delete(name);
+				unsubscribeClose?.();
+				teammates.delete(name);
+				tracker.reset(name);
+				transcriptTracker.reset(name);
+				renderWidget();
+			}
+			return { ok: false, error: err instanceof Error ? err.message : String(err) };
+		} finally {
+			spawningNames.delete(name);
+		}
 	};
 
 	const pollLeaderInbox = async () => {

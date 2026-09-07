@@ -1,3 +1,4 @@
+import { assertSpawnConfigReadable } from "./spawn-preflight.js";
 import { randomUUID } from "node:crypto";
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 import { Type, type Static } from "@sinclair/typebox";
@@ -158,12 +159,12 @@ const TeamsToolParamsSchema = Type.Object({
 	planRequired: Type.Optional(Type.Boolean({ description: "For member_spawn, start worker in plan-required mode." })),
 	teammates: Type.Optional(
 		Type.Array(Type.String(), {
-			description: "Explicit comrade names to use/spawn. If omitted, uses existing or auto-generates.",
+			description: "Explicit comrade names to spawn and use for tasks without an assignee. If omitted, unassigned tasks use existing or auto-generated names.",
 		}),
 	),
 	maxTeammates: Type.Optional(
 		Type.Integer({
-			description: "If comrades list is omitted and none exist, spawn up to this many.",
+			description: "Maximum auto-generated comrades for tasks without an assignee when no usable teammate pool exists. Named assignees are not capped.",
 			default: 4,
 			minimum: 1,
 			maximum: 16,
@@ -237,6 +238,9 @@ export function registerTeamsTool(opts: {
 			const teamDir = getTeamDir(teamId);
 			const taskListId = getTaskListId();
 			const effectiveTlId = taskListId ?? teamId;
+			if (action === "delegate" || action === "member_spawn") {
+				await assertSpawnConfigReadable(teamDir);
+			}
 			const cfg = await ensureTeamConfig(teamDir, {
 				teamId,
 				taskListId: effectiveTlId,
@@ -984,12 +988,13 @@ export function registerTeamsTool(opts: {
 				// Stop all RPC teammates (reuses leader's stopAllTeammates for proper
 				// event unsub + tracker/transcript cleanup — avoids stale state on reuse).
 				waitTracker?.clear();
+				const rpcNamesBeforeStop = new Set(teammates.keys());
 				await stopAllTeammates("team done");
 
 				// Mark config workers offline + send shutdown mailbox messages
 				const cfgWorkers = cfg.members.filter((m) => m.role === "worker" && m.status === "online");
 				for (const m of cfgWorkers) {
-					if (teammates.has(m.name)) continue; // already stopped via RPC above
+					if (rpcNamesBeforeStop.has(m.name)) continue; // already stopped via RPC above
 					const ts = new Date().toISOString();
 					try {
 						await writeToMailbox(teamDir, TEAM_MAILBOX_NS, m.name, {
@@ -1337,20 +1342,31 @@ export function registerTeamsTool(opts: {
 			const spawnModel = modelOverride && modelOverride.length > 0 ? modelOverride : undefined;
 			const spawnThinking = params.thinking;
 
-			let teammateNames: string[] = [];
-			const explicit = params.teammates;
-			if (explicit && explicit.length) {
-				teammateNames = explicit.map((n) => sanitizeName(n)).filter((n) => n.length > 0);
+			const warnings: string[] = [];
+			const validTasks: Array<{ text: string; assignee?: string }> = [];
+			for (const task of inputTasks) {
+				const text = task.text.trim();
+				if (!text) {
+					warnings.push("Skipping empty task");
+					continue;
+				}
+				const assignee = task.assignee ? sanitizeName(task.assignee) : undefined;
+				if (task.assignee && !assignee) {
+					warnings.push(`Skipping task with invalid assignee: ${text.slice(0, 60)}`);
+					continue;
+				}
+				validTasks.push({ text, assignee });
 			}
 
-			if (teammateNames.length === 0 && teammates.size > 0) {
-				teammateNames = Array.from(teammates.keys());
-			}
-
-			if (teammateNames.length === 0) {
+			// Explicit teammates remain a spawn request, and the round-robin pool
+			// stays independent of individually named task owners.
+			const explicitNames = [...new Set((params.teammates ?? []).map(sanitizeName).filter(Boolean))];
+			let teammateNames = explicitNames.length ? explicitNames : Array.from(teammates.keys());
+			const unnamedCount = validTasks.filter((task) => !task.assignee).length;
+			if (teammateNames.length === 0 && unnamedCount > 0) {
 				const maxTeammates = Math.max(1, Math.min(16, params.maxTeammates ?? 4));
-				const count = Math.min(maxTeammates, inputTasks.length);
-				const taken = new Set(teammates.keys());
+				const count = Math.min(maxTeammates, unnamedCount);
+				const taken = new Set([...teammates.keys(), ...validTasks.flatMap((task) => task.assignee ? [task.assignee] : [])]);
 				const naming = getTeamsNamingRules(style);
 				teammateNames =
 					naming.autoNameStrategy.kind === "agent"
@@ -1362,11 +1378,17 @@ export function registerTeamsTool(opts: {
 							fallbackBase: naming.autoNameStrategy.fallbackBase,
 						});
 			}
+			let rr = 0;
+			const resolvedTasks = validTasks.map((task) => ({
+				text: task.text,
+				assignee: task.assignee ?? teammateNames[rr++ % teammateNames.length],
+			}));
+			const spawnNames = new Set([...explicitNames, ...resolvedTasks.flatMap((task) => task.assignee ? [task.assignee] : [])]);
 
 			const spawned: string[] = [];
-			const warnings: string[] = [];
+			const availableNames = new Set(teammates.keys());
 
-			for (const name of teammateNames) {
+			for (const name of spawnNames) {
 				if (signal?.aborted) break;
 				if (teammates.has(name)) continue;
 				const res = await spawnTeammate(ctx, {
@@ -1380,6 +1402,7 @@ export function registerTeamsTool(opts: {
 					warnings.push(`Failed to spawn '${name}': ${res.error}`);
 					continue;
 				}
+				availableNames.add(res.name);
 				spawned.push(res.name);
 				warnings.push(...res.warnings);
 			}
@@ -1388,38 +1411,11 @@ export function registerTeamsTool(opts: {
 			// This ensures DelegationTracker has the batch registered before any
 			// worker can complete a task and emit an idle_notification.
 			const assignments: Array<{ taskId: string; assignee: string; subject: string }> = [];
-			let rr = 0;
-			for (const t of inputTasks) {
+			for (const { text, assignee } of resolvedTasks) {
 				if (signal?.aborted) break;
-
-				const text = t.text.trim();
-				if (!text) {
-					warnings.push("Skipping empty task");
-					continue;
-				}
-
-				const explicitAssignee = t.assignee ? sanitizeName(t.assignee) : undefined;
-				const assignee = explicitAssignee ?? teammateNames[rr++ % teammateNames.length];
-				if (!assignee) {
+				if (!assignee || !availableNames.has(assignee)) {
 					warnings.push(`No assignee available for task: ${text.slice(0, 60)}`);
 					continue;
-				}
-
-				if (!teammates.has(assignee)) {
-					const res = await spawnTeammate(ctx, {
-						name: assignee,
-						mode: contextMode,
-						workspaceMode: requestedWorkspaceMode,
-						model: spawnModel,
-						thinking: spawnThinking,
-					});
-					if (res.ok) {
-						spawned.push(res.name);
-						warnings.push(...res.warnings);
-					} else {
-						warnings.push(`Failed to spawn assignee '${assignee}': ${res.error}`);
-						continue;
-					}
 				}
 
 				const description = text;

@@ -359,6 +359,7 @@ export async function handleTeamShutdownCommand(opts: {
 
 	const reason = "Stopped by /team shutdown";
 	// Stop RPC teammates we own
+	const rpcNamesBeforeStop = new Set(teammates.keys());
 	await stopAllTeammates(ctx, reason);
 
 	// Best-effort: ask *manual* workers (persisted in config.json) to shut down too.
@@ -375,7 +376,7 @@ export async function handleTeamShutdownCommand(opts: {
 	const manualWorkers = (cfg?.members ?? []).filter((m) => m.role === "worker" && m.status === "online");
 	for (const m of manualWorkers) {
 		// If it's an RPC teammate we already stopped above, skip mailbox request.
-		if (teammates.has(m.name)) continue;
+		if (rpcNamesBeforeStop.has(m.name)) continue;
 		// If a manual worker still owns an in-progress task, don't force it offline in the UI.
 		if (inProgressOwners.has(m.name)) continue;
 
@@ -588,6 +589,7 @@ export async function handleTeamDoneCommand(opts: {
 		members: `${strings.memberTitle.toLowerCase()}s`,
 		count: String(teammates.size),
 	});
+	const rpcNamesBeforeStop = new Set(teammates.keys());
 	await stopAllTeammates(ctx, reason);
 
 	// Mark manual/config workers offline
@@ -595,7 +597,7 @@ export async function handleTeamDoneCommand(opts: {
 	const teamDir = getTeamDir(teamId);
 	const manualWorkers = (cfg?.members ?? []).filter((m) => m.role === "worker" && m.status === "online");
 	for (const m of manualWorkers) {
-		if (teammates.has(m.name)) continue;
+		if (rpcNamesBeforeStop.has(m.name)) continue;
 		const ts = new Date().toISOString();
 		try {
 			await writeToMailbox(teamDir, TEAM_MAILBOX_NS, m.name, {

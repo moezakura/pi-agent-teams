@@ -2,6 +2,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { withLock } from "./fs-lock.js";
 import { sanitizeName } from "./names.js";
+import { isShutdownRequestMessage } from "./protocol.js";
 
 export interface MailboxMessage {
 	from: string;
@@ -133,4 +134,34 @@ export async function popUnreadMessages(teamDir: string, namespace: string, agen
 		if (isLockTimeoutError(err)) return [];
 		throw err;
 	}
+}
+
+/** Retire only valid, unread shutdown requests from a previous worker run.
+ * Keep the raw array: coercing it would discard unrelated messages and fields.
+ * Unlike polling, malformed/unreadable data or lock failure must abort spawning.
+ */
+export async function retireShutdownRequests(teamDir: string, namespace: string, agentName: string): Promise<void> {
+	const inboxPath = getInboxPath(teamDir, namespace, agentName);
+	await ensureDir(path.dirname(inboxPath));
+	await withLock(`${inboxPath}.lock`, async () => {
+		let raw: string;
+		try {
+			raw = await fs.promises.readFile(inboxPath, "utf8");
+		} catch (err) {
+			if (isRecord(err) && err.code === "ENOENT") return;
+			throw err;
+		}
+		const arr: unknown = JSON.parse(raw);
+		if (!Array.isArray(arr)) throw new Error(`Invalid mailbox array: ${inboxPath}`);
+		let changed = false;
+		const updated = arr.map((message: unknown) => {
+			if (isRecord(message) && !Array.isArray(message) && message.read !== true &&
+				typeof message.text === "string" && isShutdownRequestMessage(message.text)) {
+				changed = true;
+				return { ...message, read: true };
+			}
+			return message;
+		});
+		if (changed) await writeJsonAtomic(inboxPath, updated);
+	}, { label: `mailbox:retire-shutdown:${namespace}:${agentName}` });
 }
